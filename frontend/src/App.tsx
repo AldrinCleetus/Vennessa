@@ -98,6 +98,8 @@ export default function App() {
   const [drawerTab, setDrawerTab] = useState<'prompt' | 'editor' | 'import_export'>('prompt');
   const [promptText, setPromptText] = useState<string>('');
   const [importStatus, setImportStatus] = useState<string>('');
+  const [isApplyingPrompt, setIsApplyingPrompt] = useState<boolean>(false);
+  const [promptError, setPromptError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // "Before" shows the pristine run; "With fixes"/"Compare" show the latest run.
@@ -230,8 +232,17 @@ export default function App() {
         }),
       });
       if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`Server returned ${res.status}: ${errText}`);
+        let errMessage = `Server error (${res.status})`;
+        try {
+          const errData = await res.json();
+          if (errData && errData.detail) {
+            errMessage = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
+          }
+        } catch {
+          const raw = await res.text();
+          if (raw) errMessage = raw;
+        }
+        throw new Error(errMessage);
       }
       const data: SimulationResult = await res.json();
       setResult(data);
@@ -446,53 +457,119 @@ export default function App() {
     handleRunSimulation(changed);
   };
 
-  // 9. Prompt-based architecture modification
-  const handleApplyPrompt = () => {
-    if (!rawModel || !promptText.trim()) return;
-    const lower = promptText.toLowerCase();
-    const clone = JSON.parse(JSON.stringify(rawModel));
+  // 9. Prompt-based architecture modification powered by Vertex AI
+  const handleApplyPrompt = async () => {
+    if (!promptText.trim()) return;
+    setIsApplyingPrompt(true);
+    setPromptError(null);
 
-    if (lower.includes('cache') || lower.includes('redis')) {
-      if (!clone.nodes.some((n: any) => n.id === 'redis' || n.id === 'cache')) {
-        clone.nodes.push({
-          id: 'redis',
-          type: 'cache',
-          replicas: 2,
-          concurrency_per_replica: 1000,
-          latency_ms: { p50: 2, p99: 5 },
-          warm_hit_rate: 0.9,
-          cold_hit_rate: 0.1,
-          warmup_s: 180,
+    try {
+      // 1. Try Vertex AI text-to-model compiler first
+      const res = await fetch('/api/ai/text-to-model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          description: promptText.trim(),
+          name: rawModel?.name ? `${rawModel.name}_custom` : 'custom_architecture'
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.architecture) {
+          setRawModel(data.architecture);
+          setRawYaml(data.yaml);
+          setPromptText('');
+          setIsDrawerOpen(false);
+          runStaticAnalysis(data.architecture);
+          handleRunSimulation(data.architecture);
+          return;
+        }
+      }
+
+      // If text-to-model returned non-ok, log for diagnostics
+      try {
+        const errJson = await res.json();
+        console.warn('Vertex AI prompt compiler returned non-200:', errJson.detail);
+      } catch {
+        // ignore parse error on fallback
+      }
+
+      // 2. Fallback: intelligent in-memory patch with strictly valid node references
+      const lower = promptText.toLowerCase();
+      const clone = JSON.parse(JSON.stringify(rawModel || {}));
+      if (!clone.nodes) clone.nodes = [];
+      if (!clone.edges) clone.edges = [];
+
+      if (lower.includes('cache') || lower.includes('redis')) {
+        if (!clone.nodes.some((n: any) => n.id === 'redis' || n.id === 'cache')) {
+          clone.nodes.push({
+            id: 'redis',
+            type: 'cache',
+            replicas: 2,
+            concurrency_per_replica: 1000,
+            latency_ms: { p50: 2, p99: 5 },
+            warm_hit_rate: 0.9,
+            cold_hit_rate: 0.1,
+            warmup_s: 180,
+          });
+        }
+      }
+
+      if (lower.includes('replica') || lower.includes('scale')) {
+        clone.nodes.forEach((n: any) => {
+          if (n.type === 'datastore' && (!n.read_replicas || n.read_replicas.length === 0)) {
+            const rep1 = `${n.id}-replica-1`;
+            const rep2 = `${n.id}-replica-2`;
+            n.read_replicas = [rep1, rep2];
+            n.read_fallback = true;
+            if (!clone.nodes.some((x: any) => x.id === rep1)) {
+              clone.nodes.push({
+                id: rep1,
+                type: 'datastore',
+                replicas: 1,
+                concurrency_per_replica: n.concurrency_per_replica || 25,
+                queue_per_replica: n.queue_per_replica || 100,
+                latency_ms: n.latency_ms ? { ...n.latency_ms } : { p50: 15, p99: 60 }
+              });
+            }
+            if (!clone.nodes.some((x: any) => x.id === rep2)) {
+              clone.nodes.push({
+                id: rep2,
+                type: 'datastore',
+                replicas: 1,
+                concurrency_per_replica: n.concurrency_per_replica || 25,
+                queue_per_replica: n.queue_per_replica || 100,
+                latency_ms: n.latency_ms ? { ...n.latency_ms } : { p50: 15, p99: 60 }
+              });
+            }
+          } else if (n.type === 'service') {
+            n.replicas = (n.replicas || 1) + 1;
+          }
         });
       }
-    }
 
-    if (lower.includes('replica') || lower.includes('scale')) {
-      clone.nodes.forEach((n: any) => {
-        if (n.type === 'datastore' && !n.read_replicas) {
-          n.read_replicas = [`${n.id}-replica-1`, `${n.id}-replica-2`];
-          n.read_fallback = true;
-        } else if (n.type === 'service') {
-          n.replicas = (n.replicas || 1) + 1;
-        }
-      });
-    }
+      if (lower.includes('jitter') || lower.includes('backoff')) {
+        clone.edges.forEach((e: any) => {
+          if (e.retry?.attempts) {
+            e.retry.backoff = 'exponential';
+            e.retry.jitter = true;
+          }
+        });
+      }
 
-    if (lower.includes('jitter') || lower.includes('backoff')) {
-      clone.edges.forEach((e: any) => {
-        if (e.retry?.attempts) {
-          e.retry.backoff = 'exponential';
-          e.retry.jitter = true;
-        }
-      });
+      setRawModel(clone);
+      setRawYaml(yaml.dump(clone, { indent: 2 }));
+      setPromptText('');
+      setIsDrawerOpen(false);
+      runStaticAnalysis(clone);
+      handleRunSimulation(clone);
+    } catch (e: any) {
+      console.error('Prompt application failed:', e);
+      setPromptError(e.message || 'Failed to apply prompt changes.');
+    } finally {
+      setIsApplyingPrompt(false);
     }
-
-    setRawModel(clone);
-    setRawYaml(yaml.dump(clone, { indent: 2 }));
-    setPromptText('');
-    setIsDrawerOpen(false);
-    runStaticAnalysis(clone);
-    handleRunSimulation(clone);
   };
 
   // 10. Manual YAML Spec Editor apply
@@ -1333,6 +1410,12 @@ export default function App() {
                       </button>
                     </div>
                   </div>
+
+                  {promptError && (
+                    <div style={{ color: '#ef4444', background: 'rgba(239,68,68,0.1)', padding: '10px', borderRadius: '6px', fontSize: '12px', marginTop: '12px' }}>
+                      ⚠️ {promptError}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1389,8 +1472,20 @@ export default function App() {
                 Cancel
               </button>
               {drawerTab === 'prompt' && (
-                <button type="button" className="run" onClick={handleApplyPrompt}>
-                  Apply Prompt Changes
+                <button
+                  type="button"
+                  className="run"
+                  onClick={handleApplyPrompt}
+                  disabled={isApplyingPrompt}
+                >
+                  {isApplyingPrompt ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>Generating with Vertex AI…</span>
+                    </>
+                  ) : (
+                    <span>Apply with Vertex AI</span>
+                  )}
                 </button>
               )}
               {drawerTab === 'editor' && (
