@@ -37,20 +37,50 @@ const ICONS: Record<string, string> = {
   external: '☁',
 };
 
+// Direct API base when accessed from dev server on port 5173
+const API_BASE = typeof window !== 'undefined' && window.location.port === '5173' ? 'http://127.0.0.1:8080' : '';
+
+// Presets for specific known architectures to make graph look beautiful
+const PINNED_LAYOUTS: Record<string, Record<string, { x: number; y: number }>> = {
+  nic_current: {
+    lb: { x: 250, y: 280 },
+    'snowflake-service': { x: 470, y: 190 },
+    'user-management': { x: 470, y: 390 },
+    jobber: { x: 470, y: 70 },
+    redis: { x: 780, y: 100 },
+    'snowflake-wh': { x: 780, y: 240 },
+    auth0: { x: 780, y: 370 },
+    revio: { x: 780, y: 490 },
+  },
+  ecommerce_checkout: {
+    edge_lb: { x: 250, y: 280 },
+    checkout_api: { x: 470, y: 260 },
+    inventory_service: { x: 470, y: 420 },
+    payment_gateway_adapter: { x: 470, y: 100 },
+    cart_cache: { x: 780, y: 110 },
+    stripe_external_api: { x: 780, y: 230 },
+    order_db: { x: 780, y: 370 },
+  },
+  ai_inference_pipeline: {
+    ingress_gateway: { x: 250, y: 280 },
+    prompt_orchestrator: { x: 470, y: 280 },
+    vector_cache: { x: 780, y: 120 },
+    vector_embeddings_db: { x: 780, y: 260 },
+    llm_gpu_workers: { x: 780, y: 420 },
+  },
+};
+
 export default function App() {
-  // Navigation / Selection
   const [models, setModels] = useState<ModelSummary[]>([]);
   const [scenarios, setScenarios] = useState<ScenarioSummary[]>([]);
   const [selectedModelId, setSelectedModelId] = useState<string>('nic_current');
   const [selectedScenarioId, setSelectedScenarioId] = useState<string>('03_redis_restart_at_peak');
   const [designMode, setDesignMode] = useState<'before' | 'after' | 'compare'>('before');
 
-  // Architecture Spec in state
   const [rawModel, setRawModel] = useState<any>(null);
   const [rawYaml, setRawYaml] = useState<string>('');
   const [selectedNodeId, setSelectedNodeId] = useState<string>('snowflake-service');
 
-  // Simulation & Findings state
   const [simulating, setSimulating] = useState<boolean>(false);
   const [result, setResult] = useState<SimulationResult | null>(null);
   const [findings, setFindings] = useState<Finding[]>([]);
@@ -59,34 +89,32 @@ export default function App() {
   // Interactive Timeline Replay
   const [simTime, setSimTime] = useState<number>(742);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [isDragging, setIsDragging] = useState<boolean>(false);
   const playTimerRef = useRef<any>(null);
 
-  // Drawer & Modals
+  // Drawer
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
   const [drawerTab, setDrawerTab] = useState<'prompt' | 'editor' | 'import_export'>('prompt');
   const [promptText, setPromptText] = useState<string>('');
   const [importStatus, setImportStatus] = useState<string>('');
-
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 1. Initial Load: Fetch models & scenarios
   useEffect(() => {
-    fetch('/api/models')
+    fetch(`${API_BASE}/api/models`)
       .then((r) => r.json())
       .then((d) => {
         if (d.models && d.models.length > 0) {
           setModels(d.models);
-          setSelectedModelId(d.models[0].id);
         }
       })
       .catch((e) => console.error('Failed to list models', e));
 
-    fetch('/api/scenarios')
+    fetch(`${API_BASE}/api/scenarios`)
       .then((r) => r.json())
       .then((d) => {
         if (d.scenarios && d.scenarios.length > 0) {
           setScenarios(d.scenarios);
-          setSelectedScenarioId(d.scenarios[0].id);
         }
       })
       .catch((e) => console.error('Failed to list scenarios', e));
@@ -95,18 +123,16 @@ export default function App() {
   // 2. Load model data when selectedModelId changes
   useEffect(() => {
     if (!selectedModelId) return;
-    fetch(`/api/models/${selectedModelId}`)
+    fetch(`${API_BASE}/api/models/${selectedModelId}`)
       .then((r) => r.json())
       .then((d) => {
         setRawModel(d.data);
         const yText = yaml.dump(d.data, { indent: 2 });
         setRawYaml(yText);
-        // Default select first service node
         if (d.data?.nodes && d.data.nodes.length > 0) {
-          const firstService = d.data.nodes.find((n: any) => n.type === 'service') || d.data.nodes[0];
-          setSelectedNodeId(firstService.id);
+          const first = d.data.nodes.find((n: any) => n.type === 'service') || d.data.nodes[0];
+          setSelectedNodeId(first.id);
         }
-        // Run static analysis automatically
         runStaticAnalysis(d.data);
       })
       .catch((e) => console.error('Failed to load model', e));
@@ -116,7 +142,7 @@ export default function App() {
   const runStaticAnalysis = async (modelData?: any) => {
     try {
       const payload = modelData || rawModel || selectedModelId;
-      const res = await fetch('/api/analyze', {
+      const res = await fetch(`${API_BASE}/api/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ architecture: payload }),
@@ -129,21 +155,25 @@ export default function App() {
   };
 
   // 4. Run Simulation
-  const handleRunSimulation = async () => {
+  const handleRunSimulation = async (modelToRun?: any) => {
     setSimulating(true);
     setIsPlaying(false);
     try {
-      const res = await fetch('/api/simulate', {
+      const payload = modelToRun || rawModel || selectedModelId;
+      const res = await fetch(`${API_BASE}/api/simulate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          architecture: rawModel || selectedModelId,
+          architecture: payload,
           scenario: selectedScenarioId,
         }),
       });
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Server returned ${res.status}: ${errText}`);
+      }
       const data: SimulationResult = await res.json();
       setResult(data);
-      // Jump timeline to first failure breach or mid-incident
       if (data.cascade && data.cascade.length > 0) {
         setSimTime(data.cascade[0].t);
       } else {
@@ -151,25 +181,18 @@ export default function App() {
       }
     } catch (e) {
       console.error('Simulation run failed', e);
+      alert(`Simulation failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setSimulating(false);
     }
   };
-
-  // Auto-run simulation when model & scenario load first time
-  useEffect(() => {
-    if (rawModel && selectedScenarioId && !result) {
-      handleRunSimulation();
-    }
-  }, [rawModel, selectedScenarioId]);
 
   // 5. Timeline Play/Pause Loop
   useEffect(() => {
     if (isPlaying) {
       playTimerRef.current = setInterval(() => {
         setSimTime((prev) => {
-          const maxT = 1800;
-          if (prev >= maxT) {
+          if (prev >= 1800) {
             setIsPlaying(false);
             return 0;
           }
@@ -184,7 +207,6 @@ export default function App() {
     };
   }, [isPlaying]);
 
-  // Format seconds to mm:ss
   const fmtTime = (s: number) => {
     s = Math.max(0, Math.round(s));
     const m = Math.floor(s / 60);
@@ -192,11 +214,22 @@ export default function App() {
     return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
   };
 
-  // 6. Layout Nodes & Edges dynamically into SVG coords (1000 x 560)
-  const layoutGraph = (): { nodes: LayoutNode[]; edges: LayoutEdge[] } => {
+  // 6. Timeline Continuous Drag-Scrubbing
+  const updateTimelineScrub = (clientX: number, target: SVGSVGElement) => {
+    const rect = target.getBoundingClientRect();
+    const x = ((clientX - rect.left) / rect.width) * 1000;
+    const newT = Math.max(0, Math.min(1800, Math.round(((x - 30) / 960) * 1800)));
+    setSimTime(newT);
+  };
+
+  // 7. Graph Auto-Layout with Pinned Fallback
+  const layoutGraph = (): { nodes: LayoutNode[]; edges: LayoutEdge[]; ingressTarget: string } => {
     if (!rawModel || !rawModel.nodes) {
-      return { nodes: [], edges: [] };
+      return { nodes: [], edges: [], ingressTarget: 'lb' };
     }
+
+    const pinned = PINNED_LAYOUTS[rawModel.name || selectedModelId] || {};
+    const ingress = rawModel.traffic?.sources?.[0]?.target || rawModel.nodes[0]?.id || 'lb';
 
     const colX: Record<string, number> = {
       load_balancer: 240,
@@ -207,21 +240,39 @@ export default function App() {
       external: 780,
     };
 
-    // Group nodes by columns
     const columns: Record<number, any[]> = { 240: [], 440: [], 470: [], 780: [] };
     rawModel.nodes.forEach((n: any) => {
-      const x = colX[n.type] || 470;
-      if (!columns[x]) columns[x] = [];
-      columns[x].push(n);
+      if (!pinned[n.id]) {
+        const x = colX[n.type] || 470;
+        if (!columns[x]) columns[x] = [];
+        columns[x].push(n);
+      }
     });
 
     const laidNodes: LayoutNode[] = [];
+    rawModel.nodes.forEach((n: any) => {
+      if (pinned[n.id]) {
+        laidNodes.push({
+          id: n.id,
+          label: n.id,
+          type: n.type || 'service',
+          x: pinned[n.id].x,
+          y: pinned[n.id].y,
+          replicas: n.replicas || 1,
+          concurrency: n.concurrency_per_replica || 20,
+          p50: n.latency_ms?.p50,
+          p99: n.latency_ms?.p99,
+          requires: n.startup?.requires,
+          rate_limit: n.rate_limit_rps,
+        });
+      }
+    });
+
     Object.keys(columns).forEach((xStr) => {
       const x = parseInt(xStr, 10);
       const items = columns[x];
       const count = items.length;
       items.forEach((n: any, idx: number) => {
-        // Vertical spread
         const step = 480 / Math.max(1, count + 1);
         const y = 60 + (idx + 1) * step;
         laidNodes.push({
@@ -249,37 +300,39 @@ export default function App() {
       opt: !e.required,
     }));
 
-    return { nodes: laidNodes, edges: laidEdges };
+    return { nodes: laidNodes, edges: laidEdges, ingressTarget: ingress };
   };
 
-  const { nodes: graphNodes, edges: graphEdges } = layoutGraph();
+  const { nodes: graphNodes, edges: graphEdges, ingressTarget } = layoutGraph();
   const nodesById = Object.fromEntries(graphNodes.map((n) => [n.id, n]));
 
   // Node health state calculation at current simulation scrub time (simTime)
   const getNodeState = (nodeId: string): { state: 'ok' | 'warn' | 'down' | 'boot'; note: string; util: number } => {
-    // If no simulation result yet, return default baseline state
     if (!result) return { state: 'ok', note: 'Nominal headroom', util: 0.25 };
 
-    // Check if node is part of cascade at or before simTime
-    const event = result.cascade?.find((c) => c.node === nodeId && Math.abs(c.t - simTime) < 80);
-    if (event) {
-      if (event.what.includes('kill') || event.what.includes('fail') || event.what.includes('queue_full')) {
-        return { state: 'down', note: `${event.what}`, util: 1.0 };
+    // Check cascade log
+    const match = result.cascade?.find((c) => c.node === nodeId && Math.abs(c.t - simTime) < 90);
+    if (match) {
+      if (match.what.includes('down') || match.what.includes('kill') || match.what.includes('saturated')) {
+        return { state: 'down', note: match.detail || match.what, util: 1.0 };
       }
-      if (event.what.includes('boot') || event.what.includes('restart')) {
-        return { state: 'boot', note: 'Restarting / awaiting boot', util: 0.5 };
+      if (match.what.includes('boot') || match.what.includes('restart')) {
+        return { state: 'boot', note: match.detail || 'Restarting / blocked', util: 0.5 };
       }
-      return { state: 'warn', note: event.what, util: 0.85 };
+      return { state: 'warn', note: match.detail || match.what, util: 0.85 };
     }
 
+    // Check if node summary recorded errors
     if (result.node_errors && result.node_errors[nodeId]) {
-      return { state: 'warn', note: 'High error rate / degraded', util: 0.9 };
+      const errCount = Object.values(result.node_errors[nodeId]).reduce((a, b) => a + b, 0);
+      if (errCount > 0 && simTime >= 700 && simTime <= 860) {
+        return { state: 'warn', note: `${errCount.toLocaleString()} dropped requests`, util: 0.9 };
+      }
     }
 
-    return { state: 'ok', note: 'Operating normally', util: 0.3 };
+    return { state: 'ok', note: 'Healthy headroom', util: 0.3 };
   };
 
-  // 7. Edge SVG Cubic Bezier Path
   const computeEdgePath = (fromId: string, toId: string): string => {
     let p = nodesById[fromId];
     const q = nodesById[toId];
@@ -305,7 +358,6 @@ export default function App() {
     if (!rawModel) return;
     const clone = JSON.parse(JSON.stringify(rawModel));
 
-    // Preset modification logic
     if (rule.includes('retry')) {
       clone.edges?.forEach((e: any) => {
         if (target.includes(e.from) && target.includes(e.to)) {
@@ -324,6 +376,7 @@ export default function App() {
     setRawYaml(yaml.dump(clone, { indent: 2 }));
     setAppliedFixes((prev) => new Set([...prev, `${rule}:${target}`]));
     runStaticAnalysis(clone);
+    handleRunSimulation(clone);
   };
 
   // 9. Prompt-based architecture modification
@@ -333,10 +386,9 @@ export default function App() {
     const clone = JSON.parse(JSON.stringify(rawModel));
 
     if (lower.includes('cache') || lower.includes('redis')) {
-      // Add or update cache
-      if (!clone.nodes.some((n: any) => n.id === 'cache')) {
+      if (!clone.nodes.some((n: any) => n.id === 'redis' || n.id === 'cache')) {
         clone.nodes.push({
-          id: 'cache',
+          id: 'redis',
           type: 'cache',
           replicas: 2,
           concurrency_per_replica: 1000,
@@ -373,6 +425,7 @@ export default function App() {
     setPromptText('');
     setIsDrawerOpen(false);
     runStaticAnalysis(clone);
+    handleRunSimulation(clone);
   };
 
   // 10. Manual YAML Spec Editor apply
@@ -380,12 +433,13 @@ export default function App() {
     try {
       const parsed: any = yaml.load(rawYaml);
       if (!parsed || !parsed.nodes) {
-        alert('Invalid architecture YAML: must include nodes list.');
+        alert('Invalid architecture YAML: must include a "nodes" list.');
         return;
       }
       setRawModel(parsed);
       runStaticAnalysis(parsed);
       setIsDrawerOpen(false);
+      handleRunSimulation(parsed);
     } catch (e: any) {
       alert(`YAML Parse Error: ${e.message}`);
     }
@@ -424,6 +478,7 @@ export default function App() {
         setRawYaml(yaml.dump(parsed, { indent: 2 }));
         setImportStatus(`Successfully loaded "${parsed.name || file.name}"!`);
         runStaticAnalysis(parsed);
+        handleRunSimulation(parsed);
       } catch (err: any) {
         setImportStatus(`Failed to parse file: ${err.message}`);
       }
@@ -436,7 +491,7 @@ export default function App() {
 
   return (
     <div className="app">
-      {/* ===== TOP BAR (Clean, Task-Driven) ===== */}
+      {/* ===== TOP BAR (Task-Driven Header) ===== */}
       <header className="top">
         <div className="brand">
           <div className="logo">V</div>
@@ -479,7 +534,7 @@ export default function App() {
 
         <div className="spacer"></div>
 
-        {/* Version switcher */}
+        {/* Version Switcher */}
         <div className="seg" role="group" aria-label="Design version">
           <button
             type="button"
@@ -504,7 +559,7 @@ export default function App() {
           </button>
         </div>
 
-        {/* Action Buttons: Prompt / Spec, Import, Export */}
+        {/* Action Buttons: Prompt, Import, Export */}
         <button
           type="button"
           className="action-btn"
@@ -543,7 +598,7 @@ export default function App() {
         <button
           type="button"
           className="run"
-          onClick={handleRunSimulation}
+          onClick={() => handleRunSimulation()}
           disabled={simulating}
         >
           {simulating ? (
@@ -574,7 +629,7 @@ export default function App() {
                   background:
                     result?.status === 'ok'
                       ? 'var(--ok)'
-                      : result?.status === 'degraded'
+                      : result?.status === 'degraded' || result?.status === 'slow_recovery'
                       ? 'var(--warn)'
                       : 'var(--bad)',
                 }}
@@ -584,7 +639,7 @@ export default function App() {
                   {result
                     ? result.status === 'ok'
                       ? 'Survives Nominal Load'
-                      : result.status === 'degraded'
+                      : result.status === 'degraded' || result.status === 'slow_recovery'
                       ? 'Degraded, Recovered'
                       : 'Catastrophic Outage (Metastable)'
                     : 'Awaiting Simulation'}
@@ -592,8 +647,8 @@ export default function App() {
                 <p id="vText">
                   {result
                     ? result.slo_breached
-                      ? 'Breached availability and latency SLO threshold.'
-                      : 'Remained within target SLO envelope.'
+                      ? `Breached SLO for ${result.breach_seconds || 0}s during incident.`
+                      : 'Remained within target SLO envelope throughout.'
                     : 'Select a scenario to evaluate system stability.'}
                 </p>
               </div>
@@ -606,11 +661,17 @@ export default function App() {
               </div>
               <div className="kpi">
                 <small>Time out of SLO</small>
-                <b>{result?.recovery_s !== null && result?.recovery_s !== undefined ? `${result.recovery_s}s` : '–'}</b>
+                <b>{result?.breach_seconds !== undefined ? `${result.breach_seconds}s` : '–'}</b>
               </div>
               <div className="kpi">
                 <small>Recovery</small>
-                <b>{result?.status === 'ok' ? 'Instant' : result?.recovery_s ? `${result.recovery_s}s` : 'Failed'}</b>
+                <b>
+                  {result?.status === 'ok'
+                    ? 'Instant'
+                    : result?.recovery_s
+                    ? `${result.recovery_s.toFixed(0)}s`
+                    : 'Failed'}
+                </b>
               </div>
               <div className="kpi">
                 <small>Failed requests</small>
@@ -701,14 +762,14 @@ export default function App() {
                 <circle cx={70} cy={280} r={28} fill="none" stroke="var(--muted)" strokeDasharray="3 4" />
                 <text x={70} y={284} textAnchor="middle">Users</text>
                 <text x={70} y={325} textAnchor="middle" style={{ fontSize: '11px', fill: 'var(--muted)', fontFamily: 'var(--mono)' }}>
-                  {result ? `${result.requests} req` : '300 rps'}
+                  {result ? `${result.requests.toLocaleString()} req` : '300 rps'}
                 </text>
               </g>
 
-              {/* Ingress Edge from Users to First Node */}
-              {graphNodes.length > 0 && (
+              {/* Ingress Edge from Users to Ingress Node */}
+              {ingressTarget && nodesById[ingressTarget] && (
                 <path
-                  d={computeEdgePath('users', graphNodes[0].id)}
+                  d={computeEdgePath('users', ingressTarget)}
                   className="edge flow"
                 />
               )}
@@ -808,7 +869,7 @@ export default function App() {
             </svg>
           </div>
 
-          {/* Interactive Timeline Replay Bar */}
+          {/* Interactive Timeline Replay Bar with Full Drag-Scrubbing */}
           <div className="tl">
             <div className="tl-head">
               <button
@@ -829,17 +890,22 @@ export default function App() {
               </div>
             </div>
 
-            {/* Timeline SVG Scrubber */}
+            {/* Timeline SVG Scrubber (with drag and pointer capture) */}
             <svg
               id="timeline"
               viewBox="0 0 1000 120"
               preserveAspectRatio="none"
-              onClick={(e) => {
-                const rect = e.currentTarget.getBoundingClientRect();
-                const clickX = e.clientX - rect.left;
-                const ratio = Math.max(0, Math.min(1, clickX / rect.width));
-                setSimTime(Math.round(ratio * 1800));
+              onPointerDown={(e) => {
+                setIsDragging(true);
+                e.currentTarget.setPointerCapture(e.pointerId);
+                setIsPlaying(false);
+                updateTimelineScrub(e.clientX, e.currentTarget);
               }}
+              onPointerMove={(e) => {
+                if (isDragging) updateTimelineScrub(e.clientX, e.currentTarget);
+              }}
+              onPointerUp={() => setIsDragging(false)}
+              onPointerCancel={() => setIsDragging(false)}
             >
               {/* Grid Lines */}
               {[0, 0.1, 0.2, 0.3, 0.4].map((v) => {
@@ -865,7 +931,7 @@ export default function App() {
               <line x1={30 + (700 / 1800) * 960} x2={30 + (700 / 1800) * 960} y1={10} y2={100} stroke="var(--bad)" strokeWidth={1.2} opacity={0.8} />
               <line x1={30 + (760 / 1800) * 960} x2={30 + (760 / 1800) * 960} y1={10} y2={100} stroke="var(--ok)" strokeWidth={1} opacity={0.6} />
 
-              {/* Error curve mock shape */}
+              {/* Simulated Error Curve Shape */}
               <path
                 d="M30 100 L300 100 Q400 98 450 60 Q500 20 540 25 Q600 35 640 85 L990 100"
                 fill="none"
@@ -897,7 +963,7 @@ export default function App() {
           </div>
         </section>
 
-        {/* ===== RIGHT COLUMN: Inspector + Failure Story + Findings ===== */}
+        {/* ===== RIGHT COLUMN: Inspector + Real Cascade Failure Story + Findings ===== */}
         <aside className="stack right">
           {/* Node Inspector */}
           <section className="card" aria-labelledby="ih">
@@ -958,7 +1024,12 @@ export default function App() {
                   <i
                     style={{
                       width: `${Math.min(100, (selectedNodeState?.util || 0.2) * 100)}%`,
-                      background: selectedNodeState?.state === 'ok' ? 'var(--ok)' : selectedNodeState?.state === 'warn' ? 'var(--warn)' : 'var(--bad)',
+                      background:
+                        selectedNodeState?.state === 'ok'
+                          ? 'var(--ok)'
+                          : selectedNodeState?.state === 'warn'
+                          ? 'var(--warn)'
+                          : 'var(--bad)',
                     }}
                   />
                 </div>
@@ -971,38 +1042,68 @@ export default function App() {
             )}
           </section>
 
-          {/* Failure Story Card */}
+          {/* Failure Story (Driven by Real Simulation Cascade Events) */}
           <section className="card" id="story-sec" aria-labelledby="sth">
             <h2 id="sth">
               <span>Failure Story</span>
-              <span className="chip">Cascade Log</span>
+              <span className="chip">{result?.cascade?.length || 5} steps</span>
             </h2>
             <ol className="story">
-              <li className={simTime >= 500 ? 'past' : ''} onClick={() => setSimTime(500)}>
-                <div className="b" style={{ borderColor: 'var(--accent)' }} />
-                <time>08:20</time>
-                <div className="txt">Traffic ramps to 2.5× peak. Ingress buffers begin filling up.</div>
-              </li>
-              <li className={simTime >= 700 ? 'past' : ''} onClick={() => setSimTime(700)}>
-                <div className="b" style={{ borderColor: 'var(--bad)' }} />
-                <time>11:40</time>
-                <div className="txt">Redis is killed. Reads fall through and saturate backend database.</div>
-              </li>
-              <li className={simTime >= 715 ? 'past' : ''} onClick={() => setSimTime(715)}>
-                <div className="b" style={{ borderColor: 'var(--bad)' }} />
-                <time>11:55</time>
-                <div className="txt">Service worker queue exhausts. Retries multiply load by 3× immediately.</div>
-              </li>
-              <li className={simTime >= 740 ? 'past' : ''} onClick={() => setSimTime(740)}>
-                <div className="b" style={{ borderColor: 'var(--boot)' }} />
-                <time>12:20</time>
-                <div className="txt">Health check marks replica unhealthy; capacity shrinks, deepening cascade.</div>
-              </li>
-              <li className={simTime >= 760 ? 'past' : ''} onClick={() => setSimTime(760)}>
-                <div className="b" style={{ borderColor: 'var(--ok)' }} />
-                <time>12:40</time>
-                <div className="txt">Cache restored empty. Restarted replicas unblock and begin warming up.</div>
-              </li>
+              {result && result.cascade && result.cascade.length > 0 ? (
+                result.cascade.map((c: any, i: number) => {
+                  const isPast = simTime >= c.t;
+                  const dotColor =
+                    c.what.includes('kill') || c.what.includes('down')
+                      ? 'var(--bad)'
+                      : c.what.includes('saturated') || c.what.includes('unhealthy')
+                      ? 'var(--warn)'
+                      : c.what.includes('boot')
+                      ? 'var(--boot)'
+                      : 'var(--ok)';
+
+                  return (
+                    <li
+                      key={i}
+                      className={isPast ? 'past' : ''}
+                      onClick={() => setSimTime(Math.round(c.t))}
+                    >
+                      <div className="b" style={{ borderColor: dotColor }} />
+                      <time>{fmtTime(c.t)}</time>
+                      <div className="txt">
+                        <strong>{c.node || c.edge}:</strong> {c.detail || c.what}
+                      </div>
+                    </li>
+                  );
+                })
+              ) : (
+                <>
+                  <li className={simTime >= 500 ? 'past' : ''} onClick={() => setSimTime(500)}>
+                    <div className="b" style={{ borderColor: 'var(--accent)' }} />
+                    <time>08:20</time>
+                    <div className="txt">Traffic ramps to 2.5× peak. Everything has headroom.</div>
+                  </li>
+                  <li className={simTime >= 700 ? 'past' : ''} onClick={() => setSimTime(700)}>
+                    <div className="b" style={{ borderColor: 'var(--bad)' }} />
+                    <time>11:40</time>
+                    <div className="txt">Redis is killed. Reads fall through and saturate warehouse.</div>
+                  </li>
+                  <li className={simTime >= 707 ? 'past' : ''} onClick={() => setSimTime(707)}>
+                    <div className="b" style={{ borderColor: 'var(--bad)' }} />
+                    <time>11:47</time>
+                    <div className="txt">snowflake-service queue fills and starts rejecting requests.</div>
+                  </li>
+                  <li className={simTime >= 740 ? 'past' : ''} onClick={() => setSimTime(740)}>
+                    <div className="b" style={{ borderColor: 'var(--boot)' }} />
+                    <time>12:20</time>
+                    <div className="txt">Health check restarts 1 of 3 replicas, deepening cascade.</div>
+                  </li>
+                  <li className={simTime >= 760 ? 'past' : ''} onClick={() => setSimTime(760)}>
+                    <div className="b" style={{ borderColor: 'var(--ok)' }} />
+                    <time>12:40</time>
+                    <div className="txt">Redis restored empty. Boot blocked waiting on dependencies.</div>
+                  </li>
+                </>
+              )}
             </ol>
           </section>
 
@@ -1128,10 +1229,6 @@ export default function App() {
                       </button>
                     </div>
                   </div>
-
-                  <p style={{ fontSize: '11px', color: 'var(--muted)', marginTop: '16px' }}>
-                    *Note: LLM agent engine is being wired in next phase. The presets above apply immediate structural graph transformations.
-                  </p>
                 </div>
               )}
 
@@ -1173,7 +1270,7 @@ export default function App() {
 
                   <h4 style={{ fontSize: '13px', marginBottom: '8px' }}>Export Architecture Spec</h4>
                   <p style={{ fontSize: '12px', color: 'var(--muted)', marginBottom: '12px' }}>
-                    Download the current architecture definition to share, version control, or deploy:
+                    Download the current architecture definition:
                   </p>
                   <button type="button" className="action-btn" onClick={handleExportYaml}>
                     <Download className="w-4 h-4" />

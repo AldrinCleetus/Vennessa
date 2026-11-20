@@ -12,6 +12,7 @@ export interface CascadeEvent {
   node?: string;
   edge?: string;
   why?: string;
+  detail?: string;
 }
 
 export interface SimulationResult {
@@ -22,6 +23,7 @@ export interface SimulationResult {
   error_rate: number;
   p50_ms: number;
   p99_ms: number;
+  breach_seconds?: number;
   recovery_s: number | null;
   wall_time_s: number;
   client_errors: Record<string, number>;
