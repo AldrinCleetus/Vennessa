@@ -1,1 +1,1 @@
-"""ArchLens FastAPI Backend."""
+"""Project Venessa FastAPI Backend."""

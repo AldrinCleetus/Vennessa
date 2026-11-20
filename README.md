@@ -1,16 +1,16 @@
-# ArchLens
+# Project Venessa
 
 > **Built for Google Startup Buildathon India 2026 (Kochi Chapter)**  
 > *Pre-mortem simulator for payment systems powered by Gemini and discrete-event simulation.*
 
-ArchLens pairs an **AI Adversary (Gemini)** with a **Deterministic Simulation Engine (SimPy)** to find payment failure modes (retry storms, gateway timeouts, non-idempotent duplicate debits) and quantify their rupee loss before launching code.
+Project Venessa pairs an **AI Adversary (Gemini)** with a **Deterministic Simulation Engine (SimPy)** to find payment failure modes (retry storms, gateway timeouts, non-idempotent duplicate debits) and quantify their rupee loss before launching code.
 
 ---
 
 ## Repository Structure
 
 ```
-archlens/
+project_venessa/
 ├── backend/                   # Python FastAPI service & simulation core
 │   ├── app/
 │   │   ├── main.py            # FastAPI entry point
@@ -68,11 +68,11 @@ The frontend will be live at `http://localhost:5173`.
 
 ## Deploying to Google Cloud Run
 
-ArchLens is built to deploy natively to **Google Cloud Run** in `asia-south1` (Mumbai) to adhere to Indian financial data residency requirements:
+Project Venessa is built to deploy natively to **Google Cloud Run** in `asia-south1` (Mumbai) to adhere to Indian financial data residency requirements:
 
 ```bash
 cd backend
-gcloud run deploy archlens-api \
+gcloud run deploy project-venessa-api \
   --source . \
   --region asia-south1 \
   --allow-unauthenticated \

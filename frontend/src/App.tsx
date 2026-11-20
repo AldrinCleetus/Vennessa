@@ -93,7 +93,7 @@ export default function App() {
       <header className="header">
         <div className="brand">
           <ShieldAlert className="w-5 h-5 text-accent" />
-          <span>ArchLens</span>
+          <span>Project Venessa</span>
           <span className="brand-badge">Buildathon 2026</span>
         </div>
 

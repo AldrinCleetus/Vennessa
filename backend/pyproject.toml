@@ -1,7 +1,7 @@
 [project]
-name = "archlens-backend"
+name = "project-venessa-backend"
 version = "0.1.0"
-description = "ArchLens API and Simulation Core - Pre-mortem simulator for payment systems"
+description = "Project Venessa API and Simulation Core - Pre-mortem simulator for payment systems"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.110.0",

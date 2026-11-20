@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api.routes import router as api_router
 
 app = FastAPI(
-    title="ArchLens API",
+    title="Project Venessa API",
     description="Pre-mortem simulator for payment systems powered by Gemini and discrete-event simulation.",
     version="0.1.0",
 )
@@ -28,7 +28,7 @@ app.include_router(api_router, prefix="/api")
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "service": "archlens-api", "version": "0.1.0"}
+    return {"status": "ok", "service": "project-venessa-api", "version": "0.1.0"}
 
 
 # Serve static frontend build if dist folder exists
