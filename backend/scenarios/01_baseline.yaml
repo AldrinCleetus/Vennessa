@@ -1,0 +1,4 @@
+name: baseline
+description: Normal traffic, nothing breaks. Should pass on any healthy architecture.
+duration_s: 1200
+warmup_s: 300

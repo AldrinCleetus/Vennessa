@@ -1,0 +1,10 @@
+name: redis_restart_at_peak
+description: Redis dies for a minute during 2x traffic and comes back empty (cold cache).
+duration_s: 1800
+warmup_s: 300
+traffic:
+  ramp:
+    - {at_s: 500, multiplier: 2.0, ramp_s: 60}
+events:
+  - {at_s: 700, action: kill, target: redis}
+  - {at_s: 760, action: restore, target: redis}
