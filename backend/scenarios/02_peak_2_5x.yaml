@@ -1,7 +1,0 @@
-name: peak_2_5x
-description: Traffic ramps to 2.5x over 2 minutes and stays there.
-duration_s: 1500
-warmup_s: 300
-traffic:
-  ramp:
-    - {at_s: 600, multiplier: 2.5, ramp_s: 120}

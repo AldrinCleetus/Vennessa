@@ -1,6 +1,0 @@
-name: warehouse_slow_5x
-description: Snowflake warehouse queries get 5x slower for 5 minutes (e.g. a heavy job on the same warehouse).
-duration_s: 1500
-warmup_s: 300
-events:
-  - {at_s: 600, action: slow, target: snowflake-wh, factor: 5, duration_s: 300}

@@ -1,8 +1,0 @@
-name: lb_replica_loss
-description: One load balancer replica dies at 1.5x traffic and does not come back.
-duration_s: 1200
-warmup_s: 300
-traffic:
-  multiplier: 1.5
-events:
-  - {at_s: 600, action: kill, target: lb, replicas: 1}

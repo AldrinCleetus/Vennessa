@@ -1,7 +1,0 @@
-name: auth0_outage
-description: Auth0 hangs (no response) for 5 minutes.
-duration_s: 1500
-warmup_s: 300
-events:
-  - {at_s: 600, action: kill, target: auth0, mode: blackhole}
-  - {at_s: 900, action: restore, target: auth0}

@@ -1,0 +1,5 @@
+name: baseline_steady
+description: Nominal steady-state traffic profile to verify latency headroom and error baseline.
+duration_s: 900
+warmup_s: 60
+events: []

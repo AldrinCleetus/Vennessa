@@ -1,0 +1,9 @@
+name: ingress_replica_loss
+description: Ingress load balancer loses 1 replica during morning traffic ramp.
+duration_s: 900
+warmup_s: 60
+traffic:
+  ramp:
+    - { at_s: 120, multiplier: 2.0, ramp_s: 60 }
+events:
+  - { at_s: 200, action: kill, target: edge_lb, replicas: 1 }

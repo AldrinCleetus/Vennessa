@@ -1,0 +1,9 @@
+name: flash_sale_surge
+description: Traffic surges 4x in 45s while cache restarts, forcing massive cold-start miss traffic onto database.
+duration_s: 900
+warmup_s: 60
+traffic:
+  ramp:
+    - { at_s: 120, multiplier: 4.0, ramp_s: 45 }
+events:
+  - { at_s: 180, action: restart, target: cart_cache }

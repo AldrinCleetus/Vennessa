@@ -1,0 +1,8 @@
+name: peak_surge_3x
+description: Traffic ramps to 3x peak load over 60 seconds to test queue headroom and thread pool limits.
+duration_s: 1200
+warmup_s: 60
+traffic:
+  ramp:
+    - { at_s: 180, multiplier: 3.0, ramp_s: 60 }
+events: []

@@ -1,0 +1,6 @@
+name: database_5x_slowdown
+description: Primary database queries run 5x slower for 5 minutes, exhausting upstream connection pools.
+duration_s: 1400
+warmup_s: 100
+events:
+  - { at_s: 300, action: slow, target: order_db, factor: 5.0, duration_s: 300 }

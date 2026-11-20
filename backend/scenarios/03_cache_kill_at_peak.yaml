@@ -1,0 +1,10 @@
+name: cache_kill_at_peak
+description: Primary cache is terminated during 2.5x traffic surge and comes back cold (stampede test).
+duration_s: 1500
+warmup_s: 120
+traffic:
+  ramp:
+    - { at_s: 240, multiplier: 2.5, ramp_s: 60 }
+events:
+  - { at_s: 400, action: kill, target: cart_cache }
+  - { at_s: 480, action: restore, target: cart_cache }

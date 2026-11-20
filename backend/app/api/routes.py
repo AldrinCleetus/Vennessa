@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.core.analyze import analyze, estimate_load
-from app.core.engine import run as run_sim
+from app.core.engine import Simulation, run as run_sim
 from app.core.model import Architecture, load_architecture
 from app.core.scenario import Scenario, load_scenario
 
@@ -81,6 +81,18 @@ def list_scenarios():
     return {"scenarios": scenarios}
 
 
+@router.get("/scenarios/{scenario_id}")
+def get_scenario(scenario_id: str):
+    """Retrieve a failure scenario definition."""
+    path = SCENARIOS_DIR / f"{scenario_id}.yaml"
+    if not path.exists():
+        path = SCENARIOS_DIR / scenario_id
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Scenario '{scenario_id}' not found")
+    data = yaml.safe_load(path.read_text())
+    return {"id": scenario_id, "data": data}
+
+
 @router.post("/analyze")
 def run_analysis(req: AnalyzeRequest):
     """Run static flaw detection on an architecture."""
@@ -145,7 +157,22 @@ def run_simulation(req: SimulateRequest):
     if req.seed is not None:
         sc.seed = req.seed
 
-    summary = run_sim(arch, sc)
+    sim = Simulation(arch, sc)
+    summary = sim.run()
+    slo = sc.effective_slo(arch)
+
+    # Sample client metrics across time for the real timeline curve
+    timeline_points = [
+        {
+            "t": s.t,
+            "err_rate": round(s.err_rate, 4),
+            "rps": s.rps,
+            "p50": round(s.p50, 1),
+            "p99": round(s.p99, 1),
+        }
+        for s in sim.col.client_series
+        if s.t % 5 == 0 or s.err_rate > 0
+    ]
 
     return {
         "architecture": summary.architecture,
@@ -164,4 +191,8 @@ def run_simulation(req: SimulateRequest):
         "nodes": [asdict(n) for n in summary.nodes],
         "cascade": summary.cascade,
         "slo_breached": not summary.passed,
+        "duration_s": sc.duration_s,
+        "warmup_s": sc.warmup_s,
+        "slo_error_rate": slo.error_rate_max,
+        "timeline": timeline_points,
     }

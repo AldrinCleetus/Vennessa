@@ -1,0 +1,7 @@
+name: payment_gateway_outage
+description: External payment gateway hangs with zero response (blackhole) for 4 minutes.
+duration_s: 1200
+warmup_s: 60
+events:
+  - { at_s: 250, action: kill, target: stripe_external_api, mode: blackhole }
+  - { at_s: 490, action: restore, target: stripe_external_api }

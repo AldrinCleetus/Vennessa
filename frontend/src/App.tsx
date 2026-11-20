@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import * as yaml from 'js-yaml';
 import { Play, Pause, RefreshCw, Download, Upload, Sparkles, X } from 'lucide-react';
-import { Finding, SimulationResult, ModelSummary, ScenarioSummary } from './types';
+import { Finding, SimulationResult, ModelSummary, ScenarioSummary, TimelinePoint } from './types';
+import { applyFix, recommendFixes, RecommendedFix } from './lib/recommendations';
 
 interface LayoutNode {
   id: string;
@@ -37,21 +38,8 @@ const ICONS: Record<string, string> = {
   external: '☁',
 };
 
-// Direct API base when accessed from dev server on port 5173
-const API_BASE = typeof window !== 'undefined' && window.location.port === '5173' ? 'http://127.0.0.1:8080' : '';
-
 // Presets for specific known architectures to make graph look beautiful
 const PINNED_LAYOUTS: Record<string, Record<string, { x: number; y: number }>> = {
-  nic_current: {
-    lb: { x: 250, y: 280 },
-    'snowflake-service': { x: 470, y: 190 },
-    'user-management': { x: 470, y: 390 },
-    jobber: { x: 470, y: 70 },
-    redis: { x: 780, y: 100 },
-    'snowflake-wh': { x: 780, y: 240 },
-    auth0: { x: 780, y: 370 },
-    revio: { x: 780, y: 490 },
-  },
   ecommerce_checkout: {
     edge_lb: { x: 250, y: 280 },
     checkout_api: { x: 470, y: 260 },
@@ -68,26 +56,39 @@ const PINNED_LAYOUTS: Record<string, Record<string, { x: number; y: number }>> =
     vector_embeddings_db: { x: 780, y: 260 },
     llm_gpu_workers: { x: 780, y: 420 },
   },
+  saas_analytics_platform: {
+    stream_lb: { x: 250, y: 280 },
+    ingest_router: { x: 470, y: 280 },
+    stream_worker_shard_0: { x: 730, y: 110 },
+    stream_worker_shard_1: { x: 730, y: 250 },
+    analytics_primary_db: { x: 770, y: 400 },
+    analytics_read_replica_1: { x: 920, y: 340 },
+    analytics_read_replica_2: { x: 920, y: 470 },
+  },
 };
 
 export default function App() {
   const [models, setModels] = useState<ModelSummary[]>([]);
   const [scenarios, setScenarios] = useState<ScenarioSummary[]>([]);
-  const [selectedModelId, setSelectedModelId] = useState<string>('nic_current');
-  const [selectedScenarioId, setSelectedScenarioId] = useState<string>('03_redis_restart_at_peak');
+  const [selectedModelId, setSelectedModelId] = useState<string>('ecommerce_checkout');
+  const [selectedScenarioId, setSelectedScenarioId] = useState<string>('03_cache_kill_at_peak');
   const [designMode, setDesignMode] = useState<'before' | 'after' | 'compare'>('before');
 
   const [rawModel, setRawModel] = useState<any>(null);
   const [rawYaml, setRawYaml] = useState<string>('');
-  const [selectedNodeId, setSelectedNodeId] = useState<string>('snowflake-service');
+  const [rawScenario, setRawScenario] = useState<any>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState<string>('checkout_api');
 
   const [simulating, setSimulating] = useState<boolean>(false);
+  const [simError, setSimError] = useState<string | null>(null);
   const [result, setResult] = useState<SimulationResult | null>(null);
+  const [baselineResult, setBaselineResult] = useState<SimulationResult | null>(null);
+  const [recommendations, setRecommendations] = useState<RecommendedFix[]>([]);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [appliedFixes, setAppliedFixes] = useState<Set<string>>(new Set());
 
   // Interactive Timeline Replay
-  const [simTime, setSimTime] = useState<number>(742);
+  const [simTime, setSimTime] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const playTimerRef = useRef<any>(null);
@@ -99,9 +100,31 @@ export default function App() {
   const [importStatus, setImportStatus] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // "Before" shows the pristine run; "With fixes"/"Compare" show the latest run.
+  const viewResult = designMode === 'before' && baselineResult ? baselineResult : result;
+
+  // Timeline geometry is driven by the scenario under test, not a fixed 30-minute mock.
+  const duration = viewResult?.duration_s ?? rawScenario?.duration_s ?? 1800;
+  const timeline: TimelinePoint[] = viewResult?.timeline ?? [];
+  const compareTimelines = designMode === 'compare' ? (baselineResult?.timeline ?? []) : [];
+  const peakErr = [...timeline, ...compareTimelines].reduce((m, p) => Math.max(m, p.err_rate), 0);
+  const errScale = Math.max(0.05, Math.ceil((peakErr * 100) / 5) * 5 / 100);
+  const xFor = (t: number) => 30 + (Math.max(0, Math.min(duration, t)) / duration) * 960;
+  const yFor = (err: number) => 100 - (Math.min(err, errScale) / errScale) * 80;
+  const toPath = (points: TimelinePoint[]) => points.length
+    ? `M30 100 ${points.map((p) => `L${xFor(p.t).toFixed(1)} ${yFor(p.err_rate).toFixed(1)}`).join(' ')} L990 100`
+    : 'M30 100 L990 100';
+  const timelinePath = toPath(timeline);
+  const baselinePath = compareTimelines.length ? toPath(compareTimelines) : null;
+  const scrubErr = timeline.filter((p) => p.t <= simTime).pop()?.err_rate ?? 0;
+  const eventMarkers = [
+    ...(rawScenario?.traffic?.ramp ?? []).map((r: any) => ({ t: r.at_s, kind: 'load' })),
+    ...(rawScenario?.events ?? []).map((e: any) => ({ t: e.at_s, kind: e.action })),
+  ];
+
   // 1. Initial Load: Fetch models & scenarios
   useEffect(() => {
-    fetch(`${API_BASE}/api/models`)
+    fetch(`/api/models`)
       .then((r) => r.json())
       .then((d) => {
         if (d.models && d.models.length > 0) {
@@ -110,7 +133,7 @@ export default function App() {
       })
       .catch((e) => console.error('Failed to list models', e));
 
-    fetch(`${API_BASE}/api/scenarios`)
+    fetch(`/api/scenarios`)
       .then((r) => r.json())
       .then((d) => {
         if (d.scenarios && d.scenarios.length > 0) {
@@ -120,15 +143,38 @@ export default function App() {
       .catch((e) => console.error('Failed to list scenarios', e));
   }, []);
 
+  // 1b. Load scenario detail when selectedScenarioId changes
+  useEffect(() => {
+    if (!selectedScenarioId) return;
+    setRawScenario(null);
+    setResult(null);
+    setBaselineResult(null);
+    setRecommendations([]);
+    setAppliedFixes(new Set());
+    setDesignMode('before');
+    setSimError(null);
+    setIsPlaying(false);
+    setSimTime(0);
+    fetch(`/api/scenarios/${selectedScenarioId}`)
+      .then((r) => r.json())
+      .then((d) => setRawScenario(d.data || null))
+      .catch((e) => console.error('Failed to load scenario', e));
+  }, [selectedScenarioId]);
+
   // 2. Load model data when selectedModelId changes
   useEffect(() => {
     if (!selectedModelId) return;
-    fetch(`${API_BASE}/api/models/${selectedModelId}`)
+    fetch(`/api/models/${selectedModelId}`)
       .then((r) => r.json())
       .then((d) => {
         setRawModel(d.data);
         const yText = yaml.dump(d.data, { indent: 2 });
         setRawYaml(yText);
+        setBaselineResult(null);
+        setResult(null);
+        setRecommendations([]);
+        setAppliedFixes(new Set());
+        setDesignMode('before');
         if (d.data?.nodes && d.data.nodes.length > 0) {
           const first = d.data.nodes.find((n: any) => n.type === 'service') || d.data.nodes[0];
           setSelectedNodeId(first.id);
@@ -142,7 +188,7 @@ export default function App() {
   const runStaticAnalysis = async (modelData?: any) => {
     try {
       const payload = modelData || rawModel || selectedModelId;
-      const res = await fetch(`${API_BASE}/api/analyze`, {
+      const res = await fetch(`/api/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ architecture: payload }),
@@ -158,9 +204,24 @@ export default function App() {
   const handleRunSimulation = async (modelToRun?: any) => {
     setSimulating(true);
     setIsPlaying(false);
+    setSimError(null);
     try {
       const payload = modelToRun || rawModel || selectedModelId;
-      const res = await fetch(`${API_BASE}/api/simulate`, {
+      const arch = typeof payload === 'string'
+        ? (await (await fetch(`/api/models/${payload}`)).json()).data
+        : payload;
+      if (!arch) throw new Error('Could not resolve the architecture to simulate.');
+
+      // Analyze the exact model being run so fixes match what this run actually hit.
+      const analysisRes = await fetch(`/api/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ architecture: arch }),
+      });
+      const analysis = analysisRes.ok ? await analysisRes.json() : { findings: [] };
+      setFindings(analysis.findings || []);
+
+      const res = await fetch(`/api/simulate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -174,14 +235,13 @@ export default function App() {
       }
       const data: SimulationResult = await res.json();
       setResult(data);
-      if (data.cascade && data.cascade.length > 0) {
-        setSimTime(data.cascade[0].t);
-      } else {
-        setSimTime(300);
-      }
+      setBaselineResult((prev) => prev ?? data);
+      setRecommendations(recommendFixes(arch, data, analysis.findings || []));
+      setSimTime(data.cascade?.[0]?.t ?? data.warmup_s ?? 0);
     } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
       console.error('Simulation run failed', e);
-      alert(`Simulation failed: ${e instanceof Error ? e.message : String(e)}`);
+      setSimError(message);
     } finally {
       setSimulating(false);
     }
@@ -192,11 +252,12 @@ export default function App() {
     if (isPlaying) {
       playTimerRef.current = setInterval(() => {
         setSimTime((prev) => {
-          if (prev >= 1800) {
+          const step = Math.max(1, Math.round(duration / 360));
+          if (prev + step >= duration) {
             setIsPlaying(false);
-            return 0;
+            return duration;
           }
-          return prev + 5;
+          return prev + step;
         });
       }, 100);
     } else {
@@ -205,7 +266,7 @@ export default function App() {
     return () => {
       if (playTimerRef.current) clearInterval(playTimerRef.current);
     };
-  }, [isPlaying]);
+  }, [isPlaying, duration]);
 
   const fmtTime = (s: number) => {
     s = Math.max(0, Math.round(s));
@@ -214,11 +275,21 @@ export default function App() {
     return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
   };
 
+  const describeEvent = (e: any) => {
+    const bits = [`${e.action} ${e.target}`];
+    if (e.replicas) bits.push(`${e.replicas} replica(s)`);
+    if (e.action === 'slow') bits.push(`${e.factor ?? 1}× latency`);
+    if (e.action === 'rate_limit') bits.push(`${e.rps} rps`);
+    if (e.mode === 'blackhole') bits.push('blackhole');
+    if (e.duration_s) bits.push(`for ${e.duration_s}s`);
+    return bits.join(' · ');
+  };
+
   // 6. Timeline Continuous Drag-Scrubbing
   const updateTimelineScrub = (clientX: number, target: SVGSVGElement) => {
     const rect = target.getBoundingClientRect();
     const x = ((clientX - rect.left) / rect.width) * 1000;
-    const newT = Math.max(0, Math.min(1800, Math.round(((x - 30) / 960) * 1800)));
+    const newT = Math.max(0, Math.min(duration, Math.round(((x - 30) / 960) * duration)));
     setSimTime(newT);
   };
 
@@ -308,24 +379,34 @@ export default function App() {
 
   // Node health state calculation at current simulation scrub time (simTime)
   const getNodeState = (nodeId: string): { state: 'ok' | 'warn' | 'down' | 'boot'; note: string; util: number } => {
-    if (!result) return { state: 'ok', note: 'Nominal headroom', util: 0.25 };
+    if (!viewResult) return { state: 'ok', note: 'Nominal headroom', util: 0.25 };
 
-    // Check cascade log
-    const match = result.cascade?.find((c) => c.node === nodeId && Math.abs(c.t - simTime) < 90);
-    if (match) {
-      if (match.what.includes('down') || match.what.includes('kill') || match.what.includes('saturated')) {
-        return { state: 'down', note: match.detail || match.what, util: 1.0 };
+    // Use the most recent cascade event at or before the scrub position.
+    const latest = (viewResult.cascade ?? [])
+      .filter((c) => c.node === nodeId && c.t <= simTime)
+      .sort((a, b) => a.t - b.t)
+      .pop();
+    if (latest) {
+      const what = latest.what.toLowerCase();
+      const detail = (latest.detail ?? latest.what).toLowerCase();
+      if (what.includes('down') || detail.includes('kill') || what.includes('saturated') || detail.includes('rejecting')) {
+        return { state: 'down', note: latest.detail || latest.what, util: 1.0 };
       }
-      if (match.what.includes('boot') || match.what.includes('restart')) {
-        return { state: 'boot', note: match.detail || 'Restarting / blocked', util: 0.5 };
+      if (what.includes('boot') || detail.includes('restart') || detail.includes('restore') || detail.includes('boot')) {
+        return { state: 'boot', note: latest.detail || 'Restarting / blocked', util: 0.5 };
       }
-      return { state: 'warn', note: match.detail || match.what, util: 0.85 };
+      if (what.includes('unhealthy') || detail.includes('slow') || detail.includes('rate limit')) {
+        return { state: 'warn', note: latest.detail || latest.what, util: 0.85 };
+      }
+      if (what.includes('up') || detail.includes('start')) {
+        return { state: 'ok', note: 'Back online', util: 0.45 };
+      }
     }
 
-    // Check if node summary recorded errors
-    if (result.node_errors && result.node_errors[nodeId]) {
-      const errCount = Object.values(result.node_errors[nodeId]).reduce((a, b) => a + b, 0);
-      if (errCount > 0 && simTime >= 700 && simTime <= 860) {
+    // Node may be strained without an injected lifecycle event.
+    if (viewResult.node_errors?.[nodeId] && simTime >= (viewResult.warmup_s ?? 0)) {
+      const errCount = Object.values(viewResult.node_errors[nodeId]).reduce((a, b) => a + b, 0);
+      if (errCount > 0) {
         return { state: 'warn', note: `${errCount.toLocaleString()} dropped requests`, util: 0.9 };
       }
     }
@@ -353,30 +434,16 @@ export default function App() {
     return `M${x1} ${p.y} C${mx} ${p.y} ${mx} ${q.y} ${x2} ${q.y}`;
   };
 
-  // 8. Apply Remediation Fix
-  const handleApplyFix = (rule: string, target: string) => {
+  // 8. Apply an evidence-based fix, then re-simulate with the changed architecture.
+  const handleApplyRecommendedFix = (fix: RecommendedFix) => {
     if (!rawModel) return;
-    const clone = JSON.parse(JSON.stringify(rawModel));
-
-    if (rule.includes('retry')) {
-      clone.edges?.forEach((e: any) => {
-        if (target.includes(e.from) && target.includes(e.to)) {
-          e.retry = { attempts: 3, backoff: 'exponential', base_ms: 100, max_ms: 1000, jitter: true };
-        }
-      });
-    } else if (rule.includes('spof')) {
-      const node = clone.nodes?.find((n: any) => n.id === target);
-      if (node) node.replicas = Math.max(2, (node.replicas || 1) + 1);
-    } else if (rule.includes('cache') || rule.includes('stampede')) {
-      const targetEdge = clone.edges?.find((e: any) => e.to === target);
-      if (targetEdge) targetEdge.timeout_ms = Math.min(targetEdge.timeout_ms || 2000, 1500);
-    }
-
-    setRawModel(clone);
-    setRawYaml(yaml.dump(clone, { indent: 2 }));
-    setAppliedFixes((prev) => new Set([...prev, `${rule}:${target}`]));
-    runStaticAnalysis(clone);
-    handleRunSimulation(clone);
+    const changed = applyFix(rawModel, fix);
+    setRawModel(changed);
+    setRawYaml(yaml.dump(changed, { indent: 2 }));
+    setAppliedFixes((prev) => new Set([...prev, fix.id]));
+    setDesignMode('after');
+    runStaticAnalysis(changed);
+    handleRunSimulation(changed);
   };
 
   // 9. Prompt-based architecture modification
@@ -627,55 +694,59 @@ export default function App() {
                 className="dot"
                 style={{
                   background:
-                    result?.status === 'ok'
+                    viewResult?.status === 'ok'
                       ? 'var(--ok)'
-                      : result?.status === 'degraded' || result?.status === 'slow_recovery'
+                      : viewResult?.status === 'degraded' || viewResult?.status === 'slow_recovery'
                       ? 'var(--warn)'
                       : 'var(--bad)',
                 }}
               />
               <div>
                 <h3 id="vTitle">
-                  {result
-                    ? result.status === 'ok'
+                  {viewResult
+                    ? viewResult.status === 'ok'
                       ? 'Survives Nominal Load'
-                      : result.status === 'degraded' || result.status === 'slow_recovery'
+                      : viewResult.status === 'degraded' || viewResult.status === 'slow_recovery'
                       ? 'Degraded, Recovered'
                       : 'Catastrophic Outage (Metastable)'
                     : 'Awaiting Simulation'}
                 </h3>
                 <p id="vText">
-                  {result
-                    ? result.slo_breached
-                      ? `Breached SLO for ${result.breach_seconds || 0}s during incident.`
+                  {viewResult
+                    ? viewResult.slo_breached
+                      ? `Breached SLO for ${viewResult.breach_seconds || 0}s during incident.`
                       : 'Remained within target SLO envelope throughout.'
                     : 'Select a scenario to evaluate system stability.'}
                 </p>
               </div>
             </div>
 
+            {simError && (
+              <p className="sim-error" role="alert">Simulation failed: {simError}</p>
+            )}
+
             <div className="kpis">
               <div className="kpi">
                 <small>Peak error rate</small>
-                <b>{result ? `${(result.error_rate * 100).toFixed(1)}%` : '–'}</b>
+                <b>{viewResult ? `${(viewResult.error_rate * 100).toFixed(1)}%` : '–'}</b>
               </div>
               <div className="kpi">
                 <small>Time out of SLO</small>
-                <b>{result?.breach_seconds !== undefined ? `${result.breach_seconds}s` : '–'}</b>
+                <b>{viewResult?.breach_seconds !== undefined ? `${viewResult.breach_seconds}s` : '–'}</b>
               </div>
               <div className="kpi">
                 <small>Recovery</small>
                 <b>
-                  {result?.status === 'ok'
+                  {viewResult?.status === 'ok'
                     ? 'Instant'
-                    : result?.recovery_s
-                    ? `${result.recovery_s.toFixed(0)}s`
+                    : viewResult?.recovery_s
+                    ? `${viewResult.recovery_s.toFixed(0)}s`
                     : 'Failed'}
                 </b>
               </div>
               <div className="kpi">
                 <small>Failed requests</small>
-                <b>{result ? Math.round(result.requests * result.error_rate).toLocaleString() : '–'}</b>
+                <b>{viewResult ? Math.round(viewResult.requests * viewResult.error_rate).toLocaleString() : '–'}</b>
               </div>
             </div>
           </section>
@@ -684,24 +755,27 @@ export default function App() {
           <section className="card" aria-labelledby="sh">
             <h2 id="sh">
               <span>Scenario Events</span>
-              <span className="chip">30 min</span>
+              <span className="chip">{fmtTime(duration)}</span>
             </h2>
             <ul className="events">
-              <li>
-                <time>08:20</time>
-                <span className="tag load">load</span>
-                <span>Traffic surges to 2.5× peak</span>
-              </li>
-              <li>
-                <time>11:40</time>
-                <span className="tag kill">kill</span>
-                <span>Target primary datastore / cache</span>
-              </li>
-              <li>
-                <time>12:40</time>
-                <span className="tag restore">restore</span>
-                <span>Restore empty cold-cache</span>
-              </li>
+              {(rawScenario?.traffic?.ramp ?? []).map((r: any, i: number) => (
+                <li key={`ramp-${i}`}>
+                  <time>{fmtTime(r.at_s)}</time>
+                  <span className="tag load">load</span>
+                  <span>Traffic ramps to {r.multiplier}×{r.ramp_s ? ` over ${r.ramp_s}s` : ''}</span>
+                </li>
+              ))}
+              {(rawScenario?.events ?? []).map((e: any, i: number) => (
+                <li key={`event-${i}`}>
+                  <time>{fmtTime(e.at_s)}</time>
+                  <span className={`tag ${e.action}`}>{e.action}</span>
+                  <span>{describeEvent(e)}</span>
+                </li>
+              ))}
+              {!rawScenario && <li><span>Loading scenario…</span></li>}
+              {rawScenario && (rawScenario.traffic?.ramp ?? []).length === 0 && (rawScenario.events ?? []).length === 0 && (
+                <li><span>No injected failures — nominal steady-state load</span></li>
+              )}
             </ul>
           </section>
 
@@ -709,32 +783,26 @@ export default function App() {
           <section className="card" aria-labelledby="ah">
             <h2 id="ah">
               <span>AI Adversary</span>
-              <span className="chip">12 tried</span>
+              <span className="chip">{scenarios.length} vectors</span>
             </h2>
             <div className="adv">
-              <div className="adv-row" onClick={() => setSelectedScenarioId('03_redis_restart_at_peak')}>
-                <span>Redis restart at 2× peak</span>
-                <span className="hit">breaks</span>
-              </div>
-              <div className="adv-row" onClick={() => setSelectedScenarioId('04_warehouse_slow_5x')}>
-                <span>Warehouse 5× slower</span>
-                <span className="hit">breaks</span>
-              </div>
-              <div className="adv-row" onClick={() => setSelectedScenarioId('05_auth0_outage')}>
-                <span>External auth at 5s latency</span>
-                <span className="hit">breaks</span>
-              </div>
-              <div className="adv-row" onClick={() => setSelectedScenarioId('06_lb_replica_loss')}>
-                <span>Lose 1 LB replica</span>
-                <span className="ok">survives</span>
-              </div>
-              <div className="adv-row" onClick={() => setSelectedScenarioId('01_baseline')}>
-                <span>Nominal baseline load</span>
-                <span className="ok">survives</span>
-              </div>
+              {scenarios.map((s) => {
+                const tried = result?.scenario === (s.name || s.id);
+                const verdict = tried ? (result?.slo_breached ? 'breaks' : 'survives') : 'not run';
+                return (
+                  <div
+                    key={s.id}
+                    className={`adv-row ${selectedScenarioId === s.id ? 'sel' : ''}`}
+                    onClick={() => setSelectedScenarioId(s.id)}
+                  >
+                    <span>{s.name || s.id}</span>
+                    <span className={verdict === 'breaks' ? 'hit' : verdict === 'survives' ? 'ok' : ''}>{verdict}</span>
+                  </div>
+                );
+              })}
             </div>
             <div className="adv-sum">
-              4 of 12 proposed stress vectors verified by discrete-event simulation.
+              Select a stress vector, then run the scenario to verify it with discrete-event simulation.
             </div>
           </section>
         </aside>
@@ -762,7 +830,7 @@ export default function App() {
                 <circle cx={70} cy={280} r={28} fill="none" stroke="var(--muted)" strokeDasharray="3 4" />
                 <text x={70} y={284} textAnchor="middle">Users</text>
                 <text x={70} y={325} textAnchor="middle" style={{ fontSize: '11px', fill: 'var(--muted)', fontFamily: 'var(--mono)' }}>
-                  {result ? `${result.requests.toLocaleString()} req` : '300 rps'}
+                  {viewResult ? `${viewResult.requests.toLocaleString()} req` : '300 rps'}
                 </text>
               </g>
 
@@ -776,7 +844,7 @@ export default function App() {
 
               {/* Render Architecture Edges with Flow Animation */}
               {graphEdges.map((e, idx) => {
-                const isBad = result?.node_errors && (result.node_errors[e.to] || result.client_errors[`${e.from}->${e.to}:timeout`]);
+                const isBad = viewResult?.node_errors && (viewResult.node_errors[e.to] || viewResult.client_errors[`${e.from}->${e.to}:timeout`]);
                 return (
                   <path
                     key={idx}
@@ -869,7 +937,8 @@ export default function App() {
             </svg>
           </div>
 
-          {/* Interactive Timeline Replay Bar with Full Drag-Scrubbing */}
+          {/* Interactive Timeline Replay — only available after a run */}
+          {viewResult ? (
           <div className="tl">
             <div className="tl-head">
               <button
@@ -881,11 +950,11 @@ export default function App() {
                 {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
               </button>
               <div className="clock">
-                t = <b>{fmtTime(simTime)}</b> <span style={{ color: 'var(--muted)', fontSize: '11px', marginLeft: '6px' }}>/ 30:00</span>
+                t = <b>{fmtTime(simTime)}</b> <span style={{ color: 'var(--muted)', fontSize: '11px', marginLeft: '6px' }}>/ {fmtTime(duration)}</span>
               </div>
               <div className="tl-legend">
-                <span><i style={{ background: 'var(--bad)' }} />current design</span>
-                <span><i style={{ background: 'var(--ok)' }} />with fixes</span>
+                <span><i style={{ background: 'var(--bad)' }} />{designMode === 'before' ? 'current design' : 'with fixes'}</span>
+                {baselinePath && <span><i style={{ background: 'var(--muted)' }} />baseline</span>}
                 <span><i style={{ background: 'var(--muted)', opacity: 0.5 }} />SLO threshold</span>
               </div>
             </div>
@@ -907,60 +976,95 @@ export default function App() {
               onPointerUp={() => setIsDragging(false)}
               onPointerCancel={() => setIsDragging(false)}
             >
-              {/* Grid Lines */}
-              {[0, 0.1, 0.2, 0.3, 0.4].map((v) => {
-                const y = 100 - (v / 0.4) * 80;
+              {/* Grid Lines (scaled to the observed error rate) */}
+              {[0, 0.25, 0.5, 0.75, 1].map((v) => {
+                const y = 100 - v * 80;
                 return (
                   <g key={v}>
                     <line x1={30} x2={990} y1={y} y2={y} stroke="var(--line)" strokeWidth={0.6} />
-                    <text x={2} y={y + 3}>{(v * 100).toFixed(0)}%</text>
+                    <text x={2} y={y + 3}>{(errScale * v * 100).toFixed(0)}%</text>
                   </g>
                 );
               })}
 
               {/* Time axis labels */}
-              {[0, 5, 10, 15, 20, 25, 30].map((m) => {
-                const x = 30 + (m / 30) * 960;
+              {[0, 1, 2, 3, 4, 5, 6].map((i) => (
+                <text key={i} x={xFor((i / 6) * duration) - 8} y={114}>{fmtTime((i / 6) * duration)}</text>
+              ))}
+
+              {/* Scenario Event Markers */}
+              {eventMarkers.map((m, i) => {
+                const color = m.kind === 'load'
+                  ? 'var(--accent)'
+                  : ['kill', 'restart'].includes(m.kind)
+                  ? 'var(--bad)'
+                  : m.kind === 'restore'
+                  ? 'var(--ok)'
+                  : 'var(--warn)';
                 return (
-                  <text key={m} x={x - 8} y={114}>{m}m</text>
+                  <line
+                    key={i}
+                    x1={xFor(m.t)}
+                    x2={xFor(m.t)}
+                    y1={10}
+                    y2={100}
+                    stroke={color}
+                    strokeWidth={1.1}
+                    opacity={0.65}
+                  />
                 );
               })}
 
-              {/* Event Marker Lines */}
-              <line x1={30 + (500 / 1800) * 960} x2={30 + (500 / 1800) * 960} y1={10} y2={100} stroke="var(--accent)" strokeWidth={1} opacity={0.6} />
-              <line x1={30 + (700 / 1800) * 960} x2={30 + (700 / 1800) * 960} y1={10} y2={100} stroke="var(--bad)" strokeWidth={1.2} opacity={0.8} />
-              <line x1={30 + (760 / 1800) * 960} x2={30 + (760 / 1800) * 960} y1={10} y2={100} stroke="var(--ok)" strokeWidth={1} opacity={0.6} />
+              {/* SLO Threshold */}
+              {viewResult?.slo_error_rate !== undefined && (
+                <line
+                  x1={30}
+                  x2={990}
+                  y1={yFor(viewResult.slo_error_rate)}
+                  y2={yFor(viewResult.slo_error_rate)}
+                  stroke="var(--muted)"
+                  strokeWidth={1}
+                  strokeDasharray="4 4"
+                  opacity={0.7}
+                />
+              )}
 
-              {/* Simulated Error Curve Shape */}
-              <path
-                d="M30 100 L300 100 Q400 98 450 60 Q500 20 540 25 Q600 35 640 85 L990 100"
-                fill="none"
-                stroke="var(--bad)"
-                strokeWidth={2}
-              />
-              <path
-                d="M30 100 L300 100 Q400 98 450 60 Q500 20 540 25 Q600 35 640 85 L990 100 L990 100 L30 100 Z"
-                fill="var(--bad)"
-                opacity={0.12}
-              />
+              {/* Baseline curve, overlaid when comparing */}
+              {baselinePath && (
+                <path d={baselinePath} fill="none" stroke="var(--muted)" strokeWidth={1.5} opacity={0.9} />
+              )}
+
+              {/* Real error-rate curve sampled from the simulation */}
+              <path d={timelinePath} fill="none" stroke="var(--bad)" strokeWidth={2} />
+              <path d={`${timelinePath} L990 100 L30 100 Z`} fill="var(--bad)" opacity={0.12} />
+              {!timeline.length && (
+                <text x={510} y={55} textAnchor="middle" fill="var(--muted)" style={{ fontSize: '12px' }}>
+                  Run a scenario to plot the real error-rate curve
+                </text>
+              )}
 
               {/* Active Scrub Marker Head */}
               <line
-                x1={30 + (simTime / 1800) * 960}
-                x2={30 + (simTime / 1800) * 960}
+                x1={xFor(simTime)}
+                x2={xFor(simTime)}
                 y1={6}
                 y2={104}
                 stroke="var(--text)"
                 strokeWidth={1.5}
               />
               <circle
-                cx={30 + (simTime / 1800) * 960}
-                cy={10}
+                cx={xFor(simTime)}
+                cy={yFor(scrubErr)}
                 r={4}
                 fill="var(--text)"
               />
             </svg>
           </div>
+          ) : (
+            <div className="tl tl-empty">
+              <span>Run a scenario to generate the replay timeline.</span>
+            </div>
+          )}
         </section>
 
         {/* ===== RIGHT COLUMN: Inspector + Real Cascade Failure Story + Findings ===== */}
@@ -1046,11 +1150,11 @@ export default function App() {
           <section className="card" id="story-sec" aria-labelledby="sth">
             <h2 id="sth">
               <span>Failure Story</span>
-              <span className="chip">{result?.cascade?.length || 5} steps</span>
+              <span className="chip">{viewResult?.cascade?.length || 0} steps</span>
             </h2>
             <ol className="story">
-              {result && result.cascade && result.cascade.length > 0 ? (
-                result.cascade.map((c: any, i: number) => {
+              {viewResult && viewResult.cascade && viewResult.cascade.length > 0 ? (
+                viewResult.cascade.map((c: any, i: number) => {
                   const isPast = simTime >= c.t;
                   const dotColor =
                     c.what.includes('kill') || c.what.includes('down')
@@ -1077,61 +1181,61 @@ export default function App() {
                 })
               ) : (
                 <>
-                  <li className={simTime >= 500 ? 'past' : ''} onClick={() => setSimTime(500)}>
-                    <div className="b" style={{ borderColor: 'var(--accent)' }} />
-                    <time>08:20</time>
-                    <div className="txt">Traffic ramps to 2.5× peak. Everything has headroom.</div>
-                  </li>
-                  <li className={simTime >= 700 ? 'past' : ''} onClick={() => setSimTime(700)}>
-                    <div className="b" style={{ borderColor: 'var(--bad)' }} />
-                    <time>11:40</time>
-                    <div className="txt">Redis is killed. Reads fall through and saturate warehouse.</div>
-                  </li>
-                  <li className={simTime >= 707 ? 'past' : ''} onClick={() => setSimTime(707)}>
-                    <div className="b" style={{ borderColor: 'var(--bad)' }} />
-                    <time>11:47</time>
-                    <div className="txt">snowflake-service queue fills and starts rejecting requests.</div>
-                  </li>
-                  <li className={simTime >= 740 ? 'past' : ''} onClick={() => setSimTime(740)}>
-                    <div className="b" style={{ borderColor: 'var(--boot)' }} />
-                    <time>12:20</time>
-                    <div className="txt">Health check restarts 1 of 3 replicas, deepening cascade.</div>
-                  </li>
-                  <li className={simTime >= 760 ? 'past' : ''} onClick={() => setSimTime(760)}>
-                    <div className="b" style={{ borderColor: 'var(--ok)' }} />
-                    <time>12:40</time>
-                    <div className="txt">Redis restored empty. Boot blocked waiting on dependencies.</div>
-                  </li>
+                  {(rawScenario?.traffic?.ramp ?? []).map((r: any, i: number) => (
+                    <li key={`story-ramp-${i}`} className={simTime >= r.at_s ? 'past' : ''} onClick={() => setSimTime(r.at_s)}>
+                      <div className="b" style={{ borderColor: 'var(--accent)' }} />
+                      <time>{fmtTime(r.at_s)}</time>
+                      <div className="txt">Traffic ramps to {r.multiplier}× peak.{r.ramp_s ? ` Ramp lasts ${r.ramp_s}s.` : ''}</div>
+                    </li>
+                  ))}
+                  {(rawScenario?.events ?? []).map((e: any, i: number) => (
+                    <li key={`story-event-${i}`} className={simTime >= e.at_s ? 'past' : ''} onClick={() => setSimTime(e.at_s)}>
+                      <div className="b" style={{ borderColor: ['kill', 'restart'].includes(e.action) ? 'var(--bad)' : e.action === 'restore' ? 'var(--ok)' : 'var(--warn)' }} />
+                      <time>{fmtTime(e.at_s)}</time>
+                      <div className="txt">{describeEvent(e)}</div>
+                    </li>
+                  ))}
+                  {!rawScenario && <li><div className="txt">Loading scenario…</div></li>}
+                  {rawScenario && (rawScenario.events ?? []).length === 0 && (rawScenario.traffic?.ramp ?? []).length === 0 && (
+                    <li className="past"><div className="txt">Nominal steady-state load — no failures injected.</div></li>
+                  )}
                 </>
               )}
             </ol>
           </section>
 
-          {/* Static Findings & Remediation */}
+          {/* Post-simulation, evidence-driven remediation */}
           <section className="card" id="findings" aria-labelledby="fh">
             <h2 id="fh">
-              <span>Findings &amp; Fixes</span>
-              <span className="chip">{findings.length} flagged</span>
+              <span>Targeted Fixes</span>
+              <span className="chip">{result ? `${recommendations.length} for this run` : 'not run yet'}</span>
             </h2>
+            <p className="fix-context">{findings.length} static weak spots analyzed for this architecture.</p>
             <div id="finds">
-              {findings.map((f, i) => {
-                const key = `${f.rule}:${f.target}`;
-                const isFixed = appliedFixes.has(key);
+              {!result && (
+                <p className="insp-empty">Run a scenario to see fixes tied to the failure it actually exposes.</p>
+              )}
+              {result && recommendations.length === 0 && (
+                <p className="insp-empty">No targeted fixes — this run stayed within its SLO envelope.</p>
+              )}
+              {recommendations.map((fix) => {
+                const isApplied = appliedFixes.has(fix.id);
                 return (
-                  <div key={i} className="find">
+                  <div key={fix.id} className="find">
                     <div className="find-h">
-                      <span className={`sev ${f.severity}`}>{f.severity}</span>
-                      <b>{f.target}</b>
+                      <span className={`sev ${fix.severity}`}>{fix.severity}</span>
+                      <b>{fix.target}</b>
                     </div>
-                    <p>{f.message}</p>
+                    <p className="fix-title">{fix.title}</p>
+                    <p className="fix-why">{fix.why}</p>
                     <div className="fix">
-                      <span>{f.fix}</span>
                       <button
                         type="button"
-                        className={`apply ${isFixed ? 'applied' : ''}`}
-                        onClick={() => handleApplyFix(f.rule, f.target)}
+                        className={`apply ${isApplied ? 'applied' : ''}`}
+                        disabled={isApplied || simulating}
+                        onClick={() => handleApplyRecommendedFix(fix)}
                       >
-                        {isFixed ? '✓ Applied' : 'Apply fix'}
+                        {isApplied ? '✓ Applied' : 'Apply fix & re-simulate'}
                       </button>
                     </div>
                   </div>
@@ -1295,6 +1399,16 @@ export default function App() {
                 </button>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {simulating && (
+        <div className="sim-overlay" role="status" aria-live="polite">
+          <div className="sim-card">
+            <div className="sim-spinner" />
+            <strong>Simulating failure scenario…</strong>
+            <span>{selectedScenarioId} · {selectedModelId}</span>
           </div>
         </div>
       )}
