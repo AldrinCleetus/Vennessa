@@ -1,9 +1,17 @@
 export interface Finding {
-  rule: str;
+  rule: string;
   severity: 'critical' | 'high' | 'medium' | 'low';
   target: string;
   message: string;
   fix: string;
+}
+
+export interface CascadeEvent {
+  t: number;
+  what: string;
+  node?: string;
+  edge?: string;
+  why?: string;
 }
 
 export interface SimulationResult {
@@ -18,10 +26,10 @@ export interface SimulationResult {
   wall_time_s: number;
   client_errors: Record<string, number>;
   node_errors: Record<string, Record<string, number>>;
-  cascade: Array<{ t: number; what: string; node?: string; edge?: string; why?: string }>;
+  cascade: CascadeEvent[];
   slo_breached: boolean;
-  duplicate_debits?: number;
-  rupee_loss?: number;
+  affected_nodes?: string[];
+  cascade_depth?: number;
 }
 
 export interface ModelSummary {

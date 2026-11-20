@@ -1,0 +1,100 @@
+name: ecommerce_checkout
+slo:
+  error_rate_max: 0.01
+  p99_ms_max: 2500
+  window_s: 30
+
+traffic:
+  sources:
+    - name: web_mobile_users
+      target: edge_lb
+      rps: 450
+
+nodes:
+  - id: edge_lb
+    type: load_balancer
+    replicas: 2
+    concurrency_per_replica: 2000
+    latency_ms: { p50: 1, p99: 4 }
+
+  - id: checkout_api
+    type: service
+    replicas: 4
+    concurrency_per_replica: 30
+    queue_per_replica: 80
+    latency_ms: { p50: 15, p99: 45 }
+    startup:
+      time_s: 15
+      requires: [cart_cache, order_db]
+    health_check:
+      interval_s: 5
+      fail_threshold: 0.3
+      unhealthy_after: 3
+
+  - id: cart_cache
+    type: cache
+    replicas: 2
+    concurrency_per_replica: 1000
+    latency_ms: { p50: 2, p99: 5 }
+    warm_hit_rate: 0.92
+    cold_hit_rate: 0.05
+    warmup_s: 180
+
+  - id: payment_gateway_adapter
+    type: service
+    replicas: 3
+    concurrency_per_replica: 20
+    queue_per_replica: 40
+    latency_ms: { p50: 40, p99: 150 }
+
+  - id: stripe_external_api
+    type: external
+    replicas: 1
+    concurrency_per_replica: 500
+    latency_ms: { p50: 250, p99: 1200 }
+    rate_limit_rps: 300
+
+  - id: order_db
+    type: datastore
+    replicas: 1
+    concurrency_per_replica: 25
+    queue_per_replica: 120
+    latency_ms: { p50: 18, p99: 80 }
+
+  - id: inventory_service
+    type: service
+    replicas: 2
+    concurrency_per_replica: 20
+    queue_per_replica: 50
+    latency_ms: { p50: 10, p99: 35 }
+
+edges:
+  - from: edge_lb
+    to: checkout_api
+    timeout_ms: 5000
+
+  - from: checkout_api
+    to: cart_cache
+    timeout_ms: 150
+
+  - from: checkout_api
+    to: inventory_service
+    timeout_ms: 800
+    retry: { attempts: 2, backoff: exponential, base_ms: 50, max_ms: 300, jitter: true }
+
+  - from: checkout_api
+    to: payment_gateway_adapter
+    timeout_ms: 4000
+    retry: { attempts: 2, backoff: fixed, base_ms: 200 }
+
+  - from: payment_gateway_adapter
+    to: stripe_external_api
+    timeout_ms: 3000
+    pool: 40
+    retry: { attempts: 1, backoff: none }
+
+  - from: checkout_api
+    to: order_db
+    timeout_ms: 2000
+    pool: 25
+    retry: { attempts: 3, backoff: none }

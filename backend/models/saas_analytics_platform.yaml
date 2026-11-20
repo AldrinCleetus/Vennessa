@@ -1,0 +1,90 @@
+name: saas_analytics_platform
+slo:
+  error_rate_max: 0.005
+  p99_ms_max: 1800
+  window_s: 30
+
+traffic:
+  sources:
+    - name: ingestion_stream
+      target: stream_lb
+      rps: 800
+
+nodes:
+  - id: stream_lb
+    type: load_balancer
+    replicas: 3
+    concurrency_per_replica: 2000
+    latency_ms: { p50: 1, p99: 3 }
+
+  - id: ingest_router
+    type: shard_router
+    replicas: 4
+    concurrency_per_replica: 500
+    latency_ms: { p50: 2, p99: 6 }
+
+  - id: stream_worker_shard_0
+    type: service
+    replicas: 2
+    concurrency_per_replica: 40
+    queue_per_replica: 200
+    latency_ms: { p50: 12, p99: 45 }
+
+  - id: stream_worker_shard_1
+    type: service
+    replicas: 2
+    concurrency_per_replica: 40
+    queue_per_replica: 200
+    latency_ms: { p50: 12, p99: 45 }
+
+  - id: analytics_primary_db
+    type: datastore
+    replicas: 1
+    concurrency_per_replica: 35
+    queue_per_replica: 150
+    latency_ms: { p50: 20, p99: 90 }
+    read_replicas: [analytics_read_replica_1, analytics_read_replica_2]
+    read_fallback: true
+
+  - id: analytics_read_replica_1
+    type: datastore
+    replicas: 1
+    concurrency_per_replica: 35
+    queue_per_replica: 150
+    latency_ms: { p50: 15, p99: 60 }
+
+  - id: analytics_read_replica_2
+    type: datastore
+    replicas: 1
+    concurrency_per_replica: 35
+    queue_per_replica: 150
+    latency_ms: { p50: 15, p99: 60 }
+
+edges:
+  - from: stream_lb
+    to: ingest_router
+    timeout_ms: 3000
+
+  - from: ingest_router
+    to: stream_worker_shard_0
+    weight: 1
+    timeout_ms: 1500
+
+  - from: ingest_router
+    to: stream_worker_shard_1
+    weight: 1
+    timeout_ms: 1500
+
+  - from: stream_worker_shard_0
+    to: analytics_primary_db
+    timeout_ms: 2000
+    write_ratio: 0.3
+    pool: 30
+    retry: { attempts: 2, backoff: exponential, base_ms: 50, max_ms: 200, jitter: true }
+
+  - from: stream_worker_shard_1
+    to: analytics_primary_db
+    timeout_ms: 2000
+    write_ratio: 0.3
+    pool: 30
+    retry: { attempts: 2, backoff: exponential, base_ms: 50, max_ms: 200, jitter: true }

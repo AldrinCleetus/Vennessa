@@ -1,0 +1,10 @@
+name: gpu_pool_degradation
+description: LLM GPU workers slow down 4x while 2 workers fail, saturating the prompt orchestrator queue.
+duration_s: 500
+warmup_s: 50
+traffic:
+  ramp:
+    - { at_s: 80, multiplier: 2.2, ramp_s: 30 }
+events:
+  - { at_s: 100, action: slow, target: llm_gpu_workers, factor: 4.0 }
+  - { at_s: 180, action: restore, target: llm_gpu_workers }

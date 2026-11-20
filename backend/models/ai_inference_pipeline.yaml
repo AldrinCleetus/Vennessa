@@ -1,0 +1,73 @@
+name: ai_inference_pipeline
+slo:
+  error_rate_max: 0.02
+  p99_ms_max: 4000
+  window_s: 30
+
+traffic:
+  sources:
+    - name: api_clients
+      target: ingress_gateway
+      rps: 120
+
+nodes:
+  - id: ingress_gateway
+    type: load_balancer
+    replicas: 2
+    concurrency_per_replica: 1000
+    latency_ms: { p50: 2, p99: 8 }
+
+  - id: prompt_orchestrator
+    type: service
+    replicas: 4
+    concurrency_per_replica: 25
+    queue_per_replica: 100
+    latency_ms: { p50: 20, p99: 60 }
+    startup:
+      time_s: 10
+      requires: [vector_cache]
+
+  - id: vector_cache
+    type: cache
+    replicas: 2
+    concurrency_per_replica: 500
+    latency_ms: { p50: 3, p99: 10 }
+    warm_hit_rate: 0.88
+    cold_hit_rate: 0.10
+    warmup_s: 120
+
+  - id: vector_embeddings_db
+    type: datastore
+    replicas: 2
+    concurrency_per_replica: 30
+    queue_per_replica: 150
+    latency_ms: { p50: 25, p99: 110 }
+
+  - id: llm_gpu_workers
+    type: service
+    replicas: 6
+    concurrency_per_replica: 4
+    queue_per_replica: 60
+    latency_ms: { p50: 450, p99: 2200 }
+
+edges:
+  - from: ingress_gateway
+    to: prompt_orchestrator
+    timeout_ms: 6000
+
+  - from: prompt_orchestrator
+    to: vector_cache
+    timeout_ms: 300
+
+  - from: prompt_orchestrator
+    to: vector_embeddings_db
+    timeout_ms: 1200
+    via_cache: vector_cache
+    pool: 40
+    retry: { attempts: 2, backoff: exponential, base_ms: 100, max_ms: 500, jitter: true }
+
+  - from: prompt_orchestrator
+    to: llm_gpu_workers
+    timeout_ms: 5000
+    pool: 24
+    retry: { attempts: 1, backoff: fixed, base_ms: 500 }

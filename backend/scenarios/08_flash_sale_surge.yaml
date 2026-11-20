@@ -1,0 +1,9 @@
+name: flash_sale_surge
+description: Traffic surges 4x in 45s while cart cache is restarted (cold start stampede during peak).
+duration_s: 600
+warmup_s: 60
+traffic:
+  ramp:
+    - { at_s: 90, multiplier: 4.0, ramp_s: 45 }
+events:
+  - { at_s: 120, action: restart, target: cart_cache }
