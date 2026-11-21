@@ -101,6 +101,13 @@ export default function App() {
   const [selectedScenarioId, setSelectedScenarioId] = useState<string>('03_cache_kill_at_peak');
   const [designMode, setDesignMode] = useState<'before' | 'after' | 'compare'>('before');
   const [activeNav, setActiveNav] = useState<string>('architecture');
+  const [showAlphaNotice, setShowAlphaNotice] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('vennessa.alpha.notice.v1') !== 'seen';
+    } catch {
+      return true;
+    }
+  });
 
   const [rawModel, setRawModel] = useState<any>(null);
   const [rawYaml, setRawYaml] = useState<string>('');
@@ -147,6 +154,24 @@ export default function App() {
   const [isApplyingPrompt, setIsApplyingPrompt] = useState<boolean>(false);
   const [promptError, setPromptError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const dismissAlphaNotice = () => {
+    try {
+      localStorage.setItem('vennessa.alpha.notice.v1', 'seen');
+    } catch {
+      // Storage can be blocked in private browsing; still dismiss for this session.
+    }
+    setShowAlphaNotice(false);
+  };
+
+  useEffect(() => {
+    if (!showAlphaNotice) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') dismissAlphaNotice();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showAlphaNotice]);
 
   // "Before" shows the pristine run; "With fixes"/"Compare" show the latest run.
   const viewResult = designMode === 'before' && baselineResult ? baselineResult : result;
@@ -1670,6 +1695,33 @@ export default function App() {
             <div className="sim-spinner" />
             <strong>{remediating ? 'Gemini is proposing fixes…' : 'Simulating failure scenario…'}</strong>
             <span>{scenarioLabel(currentScenarioObject) || selectedScenarioId} · {rawModel?.name || selectedModelId}</span>
+          </div>
+        </div>
+      )}
+
+      {showAlphaNotice && (
+        <div className="alpha-overlay" role="dialog" aria-modal="true" aria-labelledby="alpha-title">
+          <div className="alpha-card">
+            <div className="alpha-top">
+              <span className="alpha-mark"><Sparkles className="w-4 h-4" /></span>
+              <div>
+                <div className="micro">Early access · Alpha</div>
+                <h2 id="alpha-title">Venessa is very early stage</h2>
+              </div>
+            </div>
+            <p>
+              This is an alpha build. The core workflow is in place and working end to end,
+              but it is still waiting to be expanded on. Describe an architecture, let Gemini
+              attack it, simulate the fallout, and try the proposed fixes.
+            </p>
+            <ul className="alpha-list">
+              <li>Create → simulate → fix → compare works today.</li>
+              <li>Expect rough edges, evolving AI output, and a limited set of failure models.</li>
+              <li>More depth is coming: richer topologies, saved workspaces, and deeper analysis.</li>
+            </ul>
+            <div className="alpha-actions">
+              <button type="button" className="run" onClick={dismissAlphaNotice}>Let&apos;s explore</button>
+            </div>
           </div>
         </div>
       )}
