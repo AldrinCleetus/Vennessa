@@ -7,6 +7,15 @@ Project Venessa pairs an **AI Adversary (Gemini)** with a **Deterministic Simula
 
 ---
 
+## Live Demo
+
+- **Landing page:** [https://aldrincleetus.github.io/Venessa-Ascension/](https://aldrincleetus.github.io/Venessa-Ascension/)
+- **Hosted app:** [https://vennessa-1.onrender.com/](https://vennessa-1.onrender.com/)
+
+> The app is hosted on Render. Free-tier services spin down after inactivity, so the first request may take 30–60 seconds to wake up. See [RENDER_DEPLOY.md](RENDER_DEPLOY.md) for deployment details.
+
+---
+
 ## Repository Structure
 
 ```
