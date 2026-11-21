@@ -115,12 +115,22 @@ class Node(Strict):
         return self.replicas * self.concurrency_per_replica
 
 
+class CircuitBreaker(Strict):
+    """Optional additive control that fast-fails calls to a struggling dependency."""
+
+    failure_threshold: float = 0.5
+    min_calls: int = 10
+    open_s: float = 10.0
+
+
 class Retry(Strict):
     attempts: int = 0
     backoff: Literal["none", "fixed", "exponential"] = "none"
     base_ms: float = 100.0
     max_ms: float = 10_000.0
     jitter: bool = False
+    # additive: cap retries to this share of calls in a rolling second
+    budget_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class Edge(Strict):
@@ -139,6 +149,10 @@ class Edge(Strict):
     required: bool = True
     # max concurrent in-flight calls on this edge (e.g. a DB connection pool); None = unlimited
     pool: int | None = None
+    # additive controls; None/false keeps legacy behaviour
+    circuit_breaker: CircuitBreaker | None = None
+    deadline_propagation: bool = False
+    pool_timeout_ms: float | None = None
     # only requests from these traffic sources use this edge (host/path routing); None = all
     sources: list[str] | None = None
     # share of calls that are writes (0..1). Only matters when `to` has read_replicas:

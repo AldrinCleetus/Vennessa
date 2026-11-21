@@ -1,35 +1,30 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as yaml from 'js-yaml';
 import {
-  Play, Pause, RefreshCw, Download, Upload, Sparkles, X, Plus,
-  Zap, GitCompare, ShieldCheck, ShieldAlert, Layers, Wand2,
+  Activity, ArrowLeft, ArrowRight, Check, ChevronRight, Download, FileText,
+  Gauge, Layers, Pause, Play, Plus, RefreshCw, ShieldAlert, Sparkles, Target,
+  TrendingUp, Upload, X,
 } from 'lucide-react';
-import { Finding, SimulationResult, ModelSummary, ScenarioSummary, TimelinePoint } from './types';
-import { applyFix, recommendFixes, RecommendedFix } from './lib/recommendations';
+import {
+  Finding, FixVerification, ModelSummary, SimulationResult, TimelinePoint,
+} from './types';
 import { apiFetch } from './lib/api';
 
-interface LayoutNode {
-  id: string;
-  label: string;
-  type: string;
-  x: number;
-  y: number;
-  replicas: number;
-  concurrency: number;
-  p50?: number;
-  p99?: number;
-  requires?: string[];
-  rate_limit?: number;
-}
+/* ------------------------------------------------------------------ */
+/* Constants & small helpers                                           */
+/* ------------------------------------------------------------------ */
 
-interface LayoutEdge {
-  from: string;
-  to: string;
-  timeout_ms: number;
-  attempts?: number;
-  backoff?: string;
-  opt?: boolean;
-}
+type StepKey = 'design' | 'scenarios' | 'run' | 'fixes' | 'report' | 'dashboard';
+type StepState = 'active' | 'done' | 'ready' | 'locked';
+
+const STEPS: { key: StepKey; label: string; hint: string }[] = [
+  { key: 'design', label: 'Design', hint: 'Use or create' },
+  { key: 'scenarios', label: 'Stress tests', hint: 'Pick a failure' },
+  { key: 'run', label: 'Run', hint: 'See the verdict' },
+  { key: 'fixes', label: 'Fixes', hint: 'Approve changes' },
+  { key: 'report', label: 'Report', hint: 'Evidence & diff' },
+  { key: 'dashboard', label: 'Dashboard', hint: 'Executive summary' },
+];
 
 const W = 196;
 const H = 66;
@@ -42,7 +37,8 @@ const ICONS: Record<string, string> = {
   external: '☁',
 };
 
-// Presets for specific known architectures to make graph look beautiful
+// Only used to lay out the three bundled reference designs. Generated designs
+// fall back to a generic column layout.
 const PINNED_LAYOUTS: Record<string, Record<string, { x: number; y: number }>> = {
   ecommerce_checkout: {
     edge_lb: { x: 250, y: 280 },
@@ -71,36 +67,486 @@ const PINNED_LAYOUTS: Record<string, Record<string, { x: number; y: number }>> =
   },
 };
 
+interface LayoutNode {
+  id: string; label: string; type: string; x: number; y: number;
+  replicas: number; concurrency: number; p50?: number; p99?: number;
+  requires?: string[]; rate_limit?: number;
+}
+interface LayoutEdge {
+  from: string; to: string; timeout_ms: number; attempts?: number;
+  backoff?: string; opt?: boolean;
+}
+
 const fixIdOf = (f: any): string => f?.fix_id || f?.id || '';
-const scenarioLabel = (s: any): string => {
-  if (!s) return '';
-  if (typeof s === 'string') return s;
-  if (s.name) return s.name;
-  if (s.scenario_id) return s.scenario_id;
-  if (s.description) return String(s.description).slice(0, 80);
-  return 'AI scenario';
+
+// Rank by measured impact (verified first), so the strongest option is never
+// buried below cosmetic or neutral proposals.
+const rankFixes = (items: any[]): any[] => {
+  const score = (f: any): number => {
+    const v = f?.verification;
+    if (!v) return Number.POSITIVE_INFINITY;
+    const d = v.deltas || {};
+    return (v.verified && v.classification !== 'worse' ? -1000 : 0)
+      + (d.error_rate || 0) * 100
+      + (d.seconds_out_of_slo || 0) / 10
+      + (d.p99_ms || 0) / 1000;
+  };
+  return [...items].sort((a, b) => score(a) - score(b));
 };
-const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
-const STATUS_RANK: Record<string, number> = {
-  ok: 0,
-  degraded: 1,
-  slow_recovery: 2,
-  no_recovery: 3,
-};
-const numericDelta = (before: any, after: any): number | null => {
-  if (typeof before !== 'number' || typeof after !== 'number') return null;
-  return after - before;
-};
+
 const cellText = (v: any): string =>
   v === undefined || v === null ? '—' : typeof v === 'object' ? JSON.stringify(v) : String(v);
 
+const fmtTime = (s: number) => {
+  s = Math.max(0, Math.round(s));
+  const m = Math.floor(s / 60);
+  return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+};
+
+const passedOf = (r: SimulationResult | null): boolean | null => {
+  if (!r) return null;
+  // SLO breach is authoritative. Never let a status-based `passed` flag
+  // claim survival when the measured SLO was violated.
+  if (typeof r.survived === 'boolean') return r.survived;
+  if (typeof r.slo_breached === 'boolean') return !r.slo_breached;
+  return r.status === 'ok';
+};
+
+const statusColor = (status?: string) =>
+  status === 'ok' ? 'var(--green)'
+    : status === 'degraded' || status === 'slow_recovery' ? 'var(--orange)'
+      : status === 'no_recovery' ? 'var(--red)' : 'var(--ink-3)';
+
+const verdictText = (r: SimulationResult | null) => {
+  if (!r) return 'Not run yet';
+  if (r.survived === true || (!r.slo_breached && r.status === 'ok')) return 'Survived the stress test';
+  if (r.recovered === true || r.status === 'degraded' || r.status === 'slow_recovery') {
+    return r.status === 'slow_recovery' ? 'Recovered, but too slowly' : 'SLO breached, then recovered';
+  }
+  return 'SLO breached — no recovery';
+};
+
+const describeEvent = (e: any) => {
+  const bits = [`${e.action} ${e.target}`];
+  if (e.replicas) bits.push(`${e.replicas} replica(s)`);
+  if (e.action === 'slow') bits.push(`${e.factor ?? 1}× latency`);
+  if (e.action === 'rate_limit') bits.push(`${e.rps} rps`);
+  if (e.mode === 'blackhole') bits.push('blackhole');
+  if (e.duration_s) bits.push(`for ${e.duration_s}s`);
+  return bits.join(' · ');
+};
+
+const scenarioName = (s: any): string => {
+  if (!s) return 'No scenario selected';
+  const d = s.scenario || s;
+  return d.name || s.scenario_id || 'Adversarial scenario';
+};
+
+const errText = (e: unknown) => {
+  if (e instanceof Error) return e.message;
+  return String(e);
+};
+
+async function readError(res: Response): Promise<string> {
+  try {
+    const d = await res.json();
+    if (d?.detail) return typeof d.detail === 'string' ? d.detail : JSON.stringify(d.detail);
+  } catch { /* use generic */ }
+  return `Server error (${res.status})`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Graph layout & node health                                         */
+/* ------------------------------------------------------------------ */
+
+function layoutGraph(arch: any): { nodes: LayoutNode[]; edges: LayoutEdge[]; ingressTarget: string } {
+  if (!arch?.nodes) return { nodes: [], edges: [], ingressTarget: '' };
+  const pinned = PINNED_LAYOUTS[arch.name || ''] || {};
+  const ingress = arch.traffic?.sources?.[0]?.target || arch.nodes[0]?.id || '';
+  const colX: Record<string, number> = {
+    load_balancer: 240, shard_router: 440, service: 470,
+    cache: 780, datastore: 780, external: 780,
+  };
+  const columns: Record<number, any[]> = { 240: [], 440: [], 470: [], 780: [] };
+  arch.nodes.forEach((n: any) => {
+    if (!pinned[n.id]) {
+      const x = colX[n.type || 'service'] || 470;
+      (columns[x] ||= []).push(n);
+    }
+  });
+  const toLayout = (n: any, x: number, y: number): LayoutNode => ({
+    id: n.id, label: n.id, type: n.type || 'service', x, y,
+    replicas: n.replicas || 1, concurrency: n.concurrency_per_replica || 20,
+    p50: n.latency_ms?.p50, p99: n.latency_ms?.p99,
+    requires: n.startup?.requires, rate_limit: n.rate_limit_rps,
+  });
+  const nodes: LayoutNode[] = [];
+  arch.nodes.forEach((n: any) => {
+    if (pinned[n.id]) nodes.push(toLayout(n, pinned[n.id].x, pinned[n.id].y));
+  });
+  Object.keys(columns).forEach((xStr) => {
+    const x = Number(xStr);
+    const items = columns[x];
+    const step = 480 / Math.max(1, items.length + 1);
+    items.forEach((n, i) => nodes.push(toLayout(n, x, 60 + (i + 1) * step)));
+  });
+  const edges: LayoutEdge[] = (arch.edges || []).map((e: any) => ({
+    from: e.from, to: e.to, timeout_ms: e.timeout_ms || 1000,
+    attempts: e.retry?.attempts, backoff: e.retry?.backoff, opt: !e.required,
+  }));
+  return { nodes, edges, ingressTarget: ingress };
+}
+
+function nodeHealth(result: SimulationResult | null, nodeId: string, t: number) {
+  if (!result) return { state: 'ok' as const, note: 'No simulation yet', util: 0.25 };
+  const latest = (result.cascade ?? [])
+    .filter((c) => c.node === nodeId && c.t <= t)
+    .sort((a, b) => a.t - b.t)
+    .pop();
+  if (latest) {
+    const what = `${latest.what} ${latest.detail ?? ''}`.toLowerCase();
+    if (what.includes('down') || what.includes('kill') || what.includes('saturated') || what.includes('reject')) {
+      return { state: 'down' as const, note: latest.detail || latest.what, util: 1 };
+    }
+    if (what.includes('boot') || what.includes('restart') || what.includes('restore')) {
+      return { state: 'boot' as const, note: latest.detail || 'Restarting / blocked', util: 0.5 };
+    }
+    if (what.includes('unhealthy') || what.includes('slow') || what.includes('rate limit')) {
+      return { state: 'warn' as const, note: latest.detail || latest.what, util: 0.85 };
+    }
+  }
+  if (result.node_errors?.[nodeId] && t >= (result.warmup_s ?? 0)) {
+    const count = Object.values(result.node_errors[nodeId]).reduce((a, b) => a + b, 0);
+    if (count > 0) return { state: 'warn' as const, note: `${count.toLocaleString()} dropped requests`, util: 0.9 };
+  }
+  return { state: 'ok' as const, note: 'Healthy headroom', util: 0.3 };
+}
+
+/* ------------------------------------------------------------------ */
+/* Reusable visual components                                         */
+/* ------------------------------------------------------------------ */
+
+function ArchitectureGraph({
+  arch, result, simTime, selectedNodeId, onSelectNode, label,
+}: {
+  arch: any; result: SimulationResult | null; simTime: number;
+  selectedNodeId: string; onSelectNode: (id: string) => void; label: string;
+}) {
+  const { nodes, edges, ingressTarget } = layoutGraph(arch);
+  const byId = Object.fromEntries(nodes.map((n) => [n.id, n]));
+  const path = (from: string, to: string) => {
+    const a = from === 'users' ? { x: 70, y: 280 } : byId[from];
+    const b = byId[to];
+    if (!a || !b) return '';
+    const x1 = from === 'users' ? a.x + 30 : a.x + W / 2;
+    const x2 = b.x - W / 2;
+    const mx = (x1 + x2) / 2;
+    return `M${x1} ${a.y} C${mx} ${a.y} ${mx} ${b.y} ${x2} ${b.y}`;
+  };
+  const selected = byId[selectedNodeId] || nodes[0];
+  const health = selected ? nodeHealth(result, selected.id, simTime) : null;
+
+  return (
+    <div className="stage-grid">
+      <div className="card graph-card">
+        <div className="stage-head">
+          <h2>{label}</h2>
+          <div className="legend">
+            <span><i style={{ background: 'var(--green)' }} />healthy</span>
+            <span><i style={{ background: 'var(--orange)' }} />strained</span>
+            <span><i style={{ background: 'var(--red)' }} />down</span>
+            <span><i style={{ background: 'var(--boot)' }} />restarting</span>
+          </div>
+        </div>
+        <div className="graph-wrap">
+          <svg viewBox="0 0 1000 560" role="img" aria-label="Architecture graph">
+            <g className="src">
+              <circle cx={70} cy={280} r={28} fill="none" stroke="var(--ink-3)" strokeDasharray="3 4" />
+              <text x={70} y={284} textAnchor="middle">Users</text>
+              <text x={70} y={325} textAnchor="middle" style={{ fontSize: 11, fill: 'var(--ink-3)', fontFamily: 'var(--mono)' }}>
+                {result ? `${result.requests.toLocaleString()} req` : `${arch.traffic?.sources?.[0]?.rps ?? '—'} rps`}
+              </text>
+            </g>
+            {ingressTarget && path('users', ingressTarget) && <path d={path('users', ingressTarget)} className="edge flow" />}
+            {edges.map((e, i) => {
+              const bad = result?.node_errors?.[e.to] || result?.client_errors?.[`${e.from}->${e.to}:timeout`];
+              return <path key={i} d={path(e.from, e.to)} className={`edge ${bad ? 'bad' : 'flow'} ${e.opt ? 'opt' : ''}`} />;
+            })}
+            {nodes.map((n) => {
+              const st = nodeHealth(result, n.id, simTime);
+              const isSel = selectedNodeId === n.id;
+              const halo = st.state === 'down' ? 'var(--red)' : st.state === 'warn' ? 'var(--orange)' : st.state === 'boot' ? 'var(--boot)' : 'var(--accent)';
+              return (
+                <g key={n.id} className={`node ${st.state} ${isSel ? 'sel' : ''}`}
+                  transform={`translate(${n.x - W / 2}, ${n.y - H / 2})`}
+                  onClick={() => onSelectNode(n.id)}>
+                  <rect className="halo" x={-5} y={-5} width={W + 10} height={H + 10} rx={16} fill="none" stroke={halo} strokeWidth={6} />
+                  <rect className="body" width={W} height={H} rx={12} />
+                  <rect x={0} y={10} width={4} height={H - 20} rx={2} fill={st.state === 'ok' ? 'var(--green)' : st.state === 'warn' ? 'var(--orange)' : 'var(--red)'} />
+                  <text x={16} y={24}>{ICONS[n.type] || '◆'} {n.label}</text>
+                  <text x={16} y={42} className="sub">{st.note || `${n.replicas} rep · ${n.concurrency} slots`}</text>
+                  <rect x={16} y={51} width={W - 32} height={4} rx={2} fill="var(--line)" />
+                  <rect x={16} y={51} width={(W - 32) * Math.min(1, Math.max(0.1, st.util))} height={4} rx={2}
+                    fill={st.state === 'ok' ? 'var(--accent)' : st.state === 'warn' ? 'var(--orange)' : 'var(--red)'} />
+                  {Array.from({ length: Math.min(6, n.replicas) }).map((_, i) => (
+                    <circle key={i} cx={W - 14 - i * 10} cy={19} r={3.2} fill={st.state === 'down' ? 'var(--red)' : 'var(--green)'} />
+                  ))}
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+      </div>
+
+      <div className="card inspector-card">
+        <h2>Node inspector</h2>
+        {selected ? (
+          <>
+            <div className="insp-title">
+              <b>{selected.label}</b>
+              {health && <span className="state" style={{
+                background: health.state === 'ok' ? 'var(--green-tint)' : health.state === 'warn' ? 'rgba(242,166,90,.15)' : 'rgba(255,107,125,.15)',
+                color: health.state === 'ok' ? 'var(--green)' : health.state === 'warn' ? 'var(--orange)' : 'var(--red)',
+              }}>{health.state}</span>}
+            </div>
+            <div className="rows">
+              <dt>Type</dt><dd>{selected.type}</dd>
+              <dt>Replicas</dt><dd>{selected.replicas} active</dd>
+              <dt>Capacity</dt><dd>{selected.replicas * selected.concurrency} concurrent slots</dd>
+              <dt>Latency (p50 / p99)</dt><dd>{selected.p50 ?? '—'}ms / {selected.p99 ?? '—'}ms</dd>
+              {selected.requires?.length ? <><dt>Startup deps</dt><dd>{selected.requires.join(', ')}</dd></> : null}
+              {selected.rate_limit ? <><dt>Rate limit</dt><dd>{selected.rate_limit} rps</dd></> : null}
+            </div>
+            <div className="bar"><i style={{
+              width: `${Math.min(100, (health?.util || 0.2) * 100)}%`,
+              background: health?.state === 'ok' ? 'var(--green)' : health?.state === 'warn' ? 'var(--orange)' : 'var(--red)',
+            }} /></div>
+            <div className="micro" style={{ marginTop: 5 }}>{health?.note}</div>
+          </>
+        ) : <p className="insp-empty">Click a node in the graph to inspect it.</p>}
+      </div>
+    </div>
+  );
+}
+
+function Timeline({
+  result, compareTo, simTime, onScrub, isPlaying, onPlay, scenario, label = 'with fixes',
+}: {
+  result: SimulationResult; compareTo?: SimulationResult | null; simTime: number;
+  onScrub: (t: number) => void; isPlaying: boolean; onPlay: () => void;
+  scenario?: any; label?: string;
+}) {
+  const [dragging, setDragging] = useState(false);
+  const duration = result.duration_s || 300;
+  const curve = result.timeline ?? [];
+  const other = compareTo?.timeline ?? [];
+  const peak = [...curve, ...other].reduce((m, p) => Math.max(m, p.err_rate), 0);
+  const scale = Math.max(0.05, (Math.ceil((peak * 100) / 5) * 5) / 100);
+  const x = (t: number) => 30 + (Math.max(0, Math.min(duration, t)) / duration) * 960;
+  const y = (err: number) => 100 - (Math.min(err, scale) / scale) * 80;
+  const pathOf = (pts: TimelinePoint[]) => pts.length
+    ? `M30 100 ${pts.map((p) => `L${x(p.t).toFixed(1)} ${y(p.err_rate).toFixed(1)}`).join(' ')} L990 100`
+    : 'M30 100 L990 100';
+  const scrub = curve.filter((p) => p.t <= simTime).pop()?.err_rate ?? 0;
+  const markers = [
+    ...(scenario?.scenario?.traffic?.ramp ?? []).map((r: any) => ({ t: r.at_s, kind: 'load' })),
+    ...(scenario?.scenario?.events ?? []).map((e: any) => ({ t: e.at_s, kind: e.action })),
+  ];
+  const move = (clientX: number, el: SVGSVGElement) => {
+    const rect = el.getBoundingClientRect();
+    const px = ((clientX - rect.left) / rect.width) * 1000;
+    onScrub(Math.max(0, Math.min(duration, Math.round(((px - 30) / 960) * duration))));
+  };
+  return (
+    <div className="card timeline-card">
+      <div className="tl-head">
+        <button type="button" className="play" onClick={onPlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
+          {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+        </button>
+        <div className="clock">t = <b>{fmtTime(simTime)}</b> <span>/ {fmtTime(duration)}</span></div>
+        <div className="tl-legend">
+          <span><i style={{ background: 'var(--red)' }} />{label}</span>
+          {compareTo && <span><i style={{ background: 'var(--ink-3)' }} />original design</span>}
+          <span><i style={{ background: 'var(--ink-3)', opacity: 0.5 }} />SLO</span>
+        </div>
+      </div>
+      <svg id="timeline" viewBox="0 0 1000 120" preserveAspectRatio="none"
+        onPointerDown={(e) => { setDragging(true); e.currentTarget.setPointerCapture(e.pointerId); move(e.clientX, e.currentTarget); }}
+        onPointerMove={(e) => { if (dragging) move(e.clientX, e.currentTarget); }}
+        onPointerUp={() => setDragging(false)} onPointerCancel={() => setDragging(false)}>
+        {[0, 0.25, 0.5, 0.75, 1].map((v) => {
+          const yy = 100 - v * 80;
+          return <g key={v}>
+            <line x1={30} x2={990} y1={yy} y2={yy} stroke="var(--line)" strokeWidth={0.6} />
+            <text x={2} y={yy + 3}>{(scale * v * 100).toFixed(0)}%</text>
+          </g>;
+        })}
+        {[0, 1, 2, 3, 4, 5, 6].map((i) => (
+          <text key={i} x={x((i / 6) * duration) - 8} y={114}>{fmtTime((i / 6) * duration)}</text>
+        ))}
+        {markers.map((m, i) => {
+          const color = m.kind === 'load' ? 'var(--accent)' : ['kill', 'restart'].includes(m.kind) ? 'var(--red)' : m.kind === 'restore' ? 'var(--green)' : 'var(--orange)';
+          return <line key={i} x1={x(m.t)} x2={x(m.t)} y1={10} y2={100} stroke={color} strokeWidth={1.1} opacity={0.65} />;
+        })}
+        {result.slo_error_rate !== undefined && (
+          <line x1={30} x2={990} y1={y(result.slo_error_rate)} y2={y(result.slo_error_rate)} stroke="var(--ink-3)" strokeWidth={1} strokeDasharray="4 4" opacity={0.7} />
+        )}
+        {compareTo && <path d={pathOf(other)} fill="none" stroke="var(--ink-3)" strokeWidth={1.5} opacity={0.9} />}
+        <path d={pathOf(curve)} fill="none" stroke="var(--red)" strokeWidth={2} />
+        <path d={`${pathOf(curve)} L990 100 L30 100 Z`} fill="var(--red)" opacity={0.12} />
+        <line x1={x(simTime)} x2={x(simTime)} y1={6} y2={104} stroke="var(--ink)" strokeWidth={1.5} />
+        <circle cx={x(simTime)} cy={y(scrub)} r={4} fill="var(--ink)" />
+      </svg>
+    </div>
+  );
+}
+
+function ScoreGauge({ score, label, caption }: { score: number | null; label: string; caption: string }) {
+  const r = 46;
+  const circumference = 2 * Math.PI * r;
+  const value = score === null ? 0 : Math.max(0, Math.min(100, score));
+  const tone = score === null ? 'var(--ink-3)' : value >= 80 ? 'var(--green)' : value >= 50 ? 'var(--orange)' : 'var(--red)';
+  const offset = circumference * (1 - value / 100);
+  return (
+    <div className="gauge">
+      <svg viewBox="0 0 120 120" aria-label={`${label}: ${score === null ? 'not run' : `${value} out of 100`}`}>
+        <circle cx={60} cy={60} r={r} fill="none" stroke="var(--line)" strokeWidth={9} />
+        <circle cx={60} cy={60} r={r} fill="none" stroke={tone} strokeWidth={9} strokeLinecap="round"
+          strokeDasharray={circumference} strokeDashoffset={offset} transform="rotate(-90 60 60)" />
+        <text x={60} y={58} textAnchor="middle" className="gauge-value" fill={tone}>{score === null ? '—' : value}</text>
+        <text x={60} y={74} textAnchor="middle" className="gauge-unit">/ 100</text>
+      </svg>
+      <b>{label}</b>
+      <span className="micro">{caption}</span>
+    </div>
+  );
+}
+
+function Verdict({ result, label }: { result: SimulationResult | null; label: string }) {
+  const passed = passedOf(result);
+  return (
+    <div className="card verdict-card">
+      <span className="micro">{label}</span>
+      <div className="verdict">
+        <span className="dot" style={{ background: result ? statusColor(result.status) : 'var(--ink-3)' }} />
+        <div>
+          <h3>{verdictText(result)}</h3>
+          <p>{result
+            ? result.slo_breached
+              ? `SLO breached for ${result.seconds_out_of_slo ?? result.breach_seconds ?? 0}s. ` +
+                (result.post_fault_error_rate !== undefined
+                  ? `Post-fault error rate ${(result.post_fault_error_rate * 100).toFixed(2)}% — ` +
+                    (result.recovered ? 'recovered after the fault.' : 'still failing after the fault.')
+                  : 'Recovery not measured.')
+              : 'Stayed inside the target SLO envelope.'
+            : 'Run a stress test to get a verdict.'}</p>
+        </div>
+      </div>
+      <div className="kpis">
+        <div className="kpi"><small>Peak error rate</small><b>{result ? `${(result.error_rate * 100).toFixed(1)}%` : '—'}</b></div>
+        <div className="kpi"><small>Time out of SLO</small><b>{result?.seconds_out_of_slo ?? result?.breach_seconds ?? '—'}{result?.seconds_out_of_slo !== undefined || result?.breach_seconds !== undefined ? 's' : ''}</b></div>
+        <div className="kpi"><small>Recovery</small><b>{result?.status === 'ok' ? 'Instant' : result?.recovery_s ? `${result.recovery_s.toFixed(0)}s` : result ? 'Failed' : '—'}</b></div>
+        <div className="kpi"><small>Failed requests</small><b>{result ? Math.round(result.requests * result.error_rate).toLocaleString() : '—'}</b></div>
+      </div>
+      {passed === true && <div className="insight-card success"><ShieldCheckIcon /> This design survived the selected stress test.</div>}
+      {passed === false && <div className="insight-card error"><ShieldAlert className="w-3.5 h-3.5" /> This design broke under the selected stress test. Fixes are ready in step 4.</div>}
+    </div>
+  );
+}
+
+function ShieldCheckIcon() {
+  return <span style={{ color: 'var(--green)', fontWeight: 700 }}>✓</span>;
+}
+
+function FailureStory({ result, scenario, simTime, onJump }: {
+  result: SimulationResult | null; scenario: any; simTime: number; onJump: (t: number) => void;
+}) {
+  const cascade = result?.cascade ?? [];
+  const ramps = scenario?.scenario?.traffic?.ramp ?? [];
+  const events = scenario?.scenario?.events ?? [];
+  return (
+    <div className="card story-card">
+      <h2>Failure story <span className="chip">{cascade.length} steps</span></h2>
+      <ol className="story">
+        {cascade.length > 0 ? cascade.map((c, i) => {
+          const color = c.what.includes('kill') || c.what.includes('down') ? 'var(--red)'
+            : c.what.includes('saturated') || c.what.includes('unhealthy') ? 'var(--orange)'
+              : c.what.includes('boot') ? 'var(--boot)' : 'var(--green)';
+          return (
+            <li key={i} className={simTime >= c.t ? 'past' : ''} onClick={() => onJump(Math.round(c.t))}>
+              <div className="b" style={{ borderColor: color }} />
+              <time>{fmtTime(c.t)}</time>
+              <div className="txt"><strong>{c.node || c.edge}:</strong> {c.detail || c.what}</div>
+            </li>
+          );
+        }) : (
+          <>
+            {ramps.map((r: any, i: number) => (
+              <li key={`r${i}`} onClick={() => onJump(r.at_s)}>
+                <div className="b" style={{ borderColor: 'var(--accent)' }} />
+                <time>{fmtTime(r.at_s)}</time>
+                <div className="txt">Traffic ramps to {r.multiplier}×.{r.ramp_s ? ` Ramp lasts ${r.ramp_s}s.` : ''}</div>
+              </li>
+            ))}
+            {events.map((e: any, i: number) => (
+              <li key={`e${i}`} onClick={() => onJump(e.at_s)}>
+                <div className="b" style={{ borderColor: ['kill', 'restart'].includes(e.action) ? 'var(--red)' : e.action === 'restore' ? 'var(--green)' : 'var(--orange)' }} />
+                <time>{fmtTime(e.at_s)}</time>
+                <div className="txt">{describeEvent(e)}</div>
+              </li>
+            ))}
+            {!ramps.length && !events.length && <li className="past"><div className="txt">Nominal load — no failures injected.</div></li>}
+          </>
+        )}
+      </ol>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Main application                                                   */
+/* ------------------------------------------------------------------ */
+
 export default function App() {
+  /* step navigation */
+  const [step, setStep] = useState<StepKey>('design');
+
+  /* step 1 — design */
   const [models, setModels] = useState<ModelSummary[]>([]);
-  const [scenarios, setScenarios] = useState<ScenarioSummary[]>([]);
-  const [selectedModelId, setSelectedModelId] = useState<string>('ecommerce_checkout');
-  const [selectedScenarioId, setSelectedScenarioId] = useState<string>('03_cache_kill_at_peak');
-  const [designMode, setDesignMode] = useState<'before' | 'after' | 'compare'>('before');
-  const [activeNav, setActiveNav] = useState<string>('architecture');
+  const [templateId, setTemplateId] = useState('');
+  const [design, setDesign] = useState<any>(null);
+  const [designYaml, setDesignYaml] = useState('');
+  const [designFindings, setDesignFindings] = useState<Finding[]>([]);
+  const [designSource, setDesignSource] = useState<'template' | 'generated' | 'import' | null>(null);
+
+  /* step 2 — scenarios */
+  const [scenarios, setScenarios] = useState<any[]>([]);
+  const [selectedScenario, setSelectedScenario] = useState<any>(null);
+  const [generatingScenarios, setGeneratingScenarios] = useState(false);
+  const [scenarioError, setScenarioError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
+
+  /* step 3 — baseline run */
+  const [baselineRun, setBaselineRun] = useState<SimulationResult | null>(null);
+  const [running, setRunning] = useState(false);
+  const [remediating, setRemediating] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+
+  /* step 4 — fixes */
+  const [fixes, setFixes] = useState<any[]>([]);
+  const [selectedFixIds, setSelectedFixIds] = useState<Set<string>>(new Set());
+  const [fixError, setFixError] = useState<string | null>(null);
+
+  /* step 5 — patched design + report */
+  const [patchedDesign, setPatchedDesign] = useState<any>(null);
+  const [patchedYaml, setPatchedYaml] = useState('');
+  const [patchedRun, setPatchedRun] = useState<SimulationResult | null>(null);
+  const [applying, setApplying] = useState(false);
+  const [appliedFixIds, setAppliedFixIds] = useState<string[]>([]);
+  const [lastDiff, setLastDiff] = useState<any>(null);
+  const [reportWithoutFixes, setReportWithoutFixes] = useState(false);
+
+  /* shared UI */
   const [showAlphaNotice, setShowAlphaNotice] = useState<boolean>(() => {
     try {
       return localStorage.getItem('vennessa.alpha.notice.v1') !== 'seen';
@@ -108,52 +554,35 @@ export default function App() {
       return true;
     }
   });
-
-  const [rawModel, setRawModel] = useState<any>(null);
-  const [rawYaml, setRawYaml] = useState<string>('');
-  const [rawScenario, setRawScenario] = useState<any>(null);
-  const [selectedNodeId, setSelectedNodeId] = useState<string>('checkout_api');
-
-  const [simulating, setSimulating] = useState<boolean>(false);
-  const [simError, setSimError] = useState<string | null>(null);
-  const [result, setResult] = useState<SimulationResult | null>(null);
-  const [baselineResult, setBaselineResult] = useState<SimulationResult | null>(null);
-  const [recommendations, setRecommendations] = useState<RecommendedFix[]>([]);
-  const [findings, setFindings] = useState<Finding[]>([]);
-  const [appliedFixes, setAppliedFixes] = useState<Set<string>>(new Set());
-
-  // ---- AI-native workflow state ----
-  const [isCreatingNew, setIsCreatingNew] = useState(false);
-  const [aiScenarios, setAiScenarios] = useState<any[]>([]);
-  const [selectedAiScenario, setSelectedAiScenario] = useState<any | null>(null);
-  const [aiFixes, setAiFixes] = useState<any[]>([]);
-  const [selectedFixIds, setSelectedFixIds] = useState<Set<string>>(new Set());
-  const [baselineModel, setBaselineModel] = useState<any | null>(null);
-  const [compareData, setCompareData] = useState<any | null>(null);
-  const [currentFingerprint, setCurrentFingerprint] = useState<string | null>(null);
-  const [lastDiff, setLastDiff] = useState<any | null>(null);
-  const [aiStatus, setAiStatus] = useState('');
-  const [aiWarnings, setAiWarnings] = useState<string[]>([]);
-  const [generatingScenarios, setGeneratingScenarios] = useState(false);
-  const [remediating, setRemediating] = useState(false);
-  const [applyingFixes, setApplyingFixes] = useState(false);
-  const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
-  const skipScenarioFetchRef = useRef<string | null>(null);
-
-  // Interactive Timeline Replay
-  const [simTime, setSimTime] = useState<number>(0);
-  const [isPlaying, setIsPlaying] = useState<boolean>(false);
-  const [isDragging, setIsDragging] = useState<boolean>(false);
-  const playTimerRef = useRef<any>(null);
-
-  // Drawer
-  const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
-  const [drawerTab, setDrawerTab] = useState<'prompt' | 'editor' | 'import_export'>('prompt');
-  const [promptText, setPromptText] = useState<string>('');
-  const [importStatus, setImportStatus] = useState<string>('');
-  const [isApplyingPrompt, setIsApplyingPrompt] = useState<boolean>(false);
+  const [simTime, setSimTime] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [selectedNodeId, setSelectedNodeId] = useState('');
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [promptText, setPromptText] = useState('');
   const [promptError, setPromptError] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [generatingDesign, setGeneratingDesign] = useState(false);
+  const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    apiFetch('/api/models')
+      .then((r) => r.json())
+      .then((d) => setModels(Array.isArray(d.models) ? d.models : []))
+      .catch((e) => console.error('Failed to list models', e));
+  }, []);
+
+  useEffect(() => {
+    if (!isPlaying) return;
+    const duration = patchedRun?.duration_s || baselineRun?.duration_s || 300;
+    const timer = window.setInterval(() => {
+      setSimTime((prev) => {
+        const next = prev + Math.max(1, Math.round(duration / 360));
+        if (next >= duration) { setIsPlaying(false); return duration; }
+        return next;
+      });
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [isPlaying, baselineRun, patchedRun]);
 
   const dismissAlphaNotice = () => {
     try {
@@ -173,1528 +602,1001 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [showAlphaNotice]);
 
-  // "Before" shows the pristine run; "With fixes"/"Compare" show the latest run.
-  const viewResult = designMode === 'before' && baselineResult ? baselineResult : result;
+  /* ---- derived state ---- */
+  const baselinePassed = passedOf(baselineRun);
+  const patchedPassed = passedOf(patchedRun);
+  const selectedFixes = fixes.filter((f) => selectedFixIds.has(fixIdOf(f)) && f.valid !== false);
 
-  // Timeline geometry is driven by the scenario under test, not a fixed 30-minute mock.
-  const duration = viewResult?.duration_s ?? rawScenario?.duration_s ?? 1800;
-  const timeline: TimelinePoint[] = viewResult?.timeline ?? [];
-  const compareTimelines = designMode === 'compare' ? (baselineResult?.timeline ?? []) : [];
-  const peakErr = [...timeline, ...compareTimelines].reduce((m, p) => Math.max(m, p.err_rate), 0);
-  const errScale = Math.max(0.05, Math.ceil((peakErr * 100) / 5) * 5 / 100);
-  const xFor = (t: number) => 30 + (Math.max(0, Math.min(duration, t)) / duration) * 960;
-  const yFor = (err: number) => 100 - (Math.min(err, errScale) / errScale) * 80;
-  const toPath = (points: TimelinePoint[]) => points.length
-    ? `M30 100 ${points.map((p) => `L${xFor(p.t).toFixed(1)} ${yFor(p.err_rate).toFixed(1)}`).join(' ')} L990 100`
-    : 'M30 100 L990 100';
-  const timelinePath = toPath(timeline);
-  const baselinePath = compareTimelines.length ? toPath(compareTimelines) : null;
-  const scrubErr = timeline.filter((p) => p.t <= simTime).pop()?.err_rate ?? 0;
-  const eventMarkers = [
-    ...(rawScenario?.traffic?.ramp ?? []).map((r: any) => ({ t: r.at_s, kind: 'load' })),
-    ...(rawScenario?.events ?? []).map((e: any) => ({ t: e.at_s, kind: e.action })),
-  ];
+  const unlocked: Record<StepKey, boolean> = {
+    design: true,
+    scenarios: !!design,
+    run: !!design && !!selectedScenario,
+    fixes: !!baselineRun && baselinePassed === false,
+    report: !!baselineRun && (baselinePassed === true || !!patchedRun || reportWithoutFixes),
+    dashboard: !!baselineRun && (baselinePassed === true || !!patchedRun || reportWithoutFixes),
+  };
+  const stepIndex = (k: StepKey) => STEPS.findIndex((s) => s.key === k);
 
-  const currentScenarioObject: any = selectedAiScenario?.scenario ?? rawScenario ?? null;
-  const currentPassed: boolean | null = result
-    ? (typeof (result as any).passed === 'boolean'
-        ? (result as any).passed
-        : (!result.slo_breached && result.status === 'ok'))
-    : null;
-  const selectedFixes = aiFixes.filter((f) => selectedFixIds.has(fixIdOf(f)));
-  const fpShort = currentFingerprint ? currentFingerprint.slice(0, 8) : '—';
-
-  const focusSection = (id: string, mode?: 'before' | 'after' | 'compare') => {
-    if (mode) setDesignMode(mode);
-    requestAnimationFrame(() => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+  const stepState = (k: StepKey): StepState => {
+    if (k === step) return 'active';
+    if (!unlocked[k]) return 'locked';
+    return stepIndex(k) < stepIndex(step) ? 'done' : 'ready';
   };
 
-  // 1. Initial Load: Fetch models & scenarios
-  useEffect(() => {
-    apiFetch(`/api/models`)
-      .then((r) => r.json())
-      .then((d) => {
-        if (d.models && d.models.length > 0) {
-          setModels(d.models);
-        }
-      })
-      .catch((e) => console.error('Failed to list models', e));
+  const goToStep = (k: StepKey) => { if (unlocked[k]) { setStep(k); setIsPlaying(false); } };
 
-    apiFetch(`/api/scenarios`)
-      .then((r) => r.json())
-      .then((d) => {
-        if (d.scenarios && d.scenarios.length > 0) {
-          setScenarios(d.scenarios);
-        }
-      })
-      .catch((e) => console.error('Failed to list scenarios', e));
-  }, []);
+  /* ---- step 1 actions ---- */
 
-  // 1b. Load scenario detail when selectedScenarioId changes (AI-generated ids are skipped).
-  useEffect(() => {
-    if (!selectedScenarioId) return;
-    if (skipScenarioFetchRef.current === selectedScenarioId) {
-      skipScenarioFetchRef.current = null;
-      return;
-    }
-    setRawScenario(null);
-    setSelectedAiScenario(null);
-    setResult(null);
-    setBaselineResult(null);
-    setRecommendations([]);
-    setAppliedFixes(new Set());
-    setAiFixes([]);
+  // One reset path for every way of choosing a design. This is what prevents
+  // stale results from one run bleeding into the next.
+  const installDesign = async (arch: any, source: 'template' | 'generated' | 'import') => {
+    if (!arch?.nodes) throw new Error('Architecture must contain nodes.');
+    setPromptError(null);
+    setDesign(arch);
+    setDesignYaml(yaml.dump(arch, { indent: 2 }));
+    setDesignSource(source);
+    setScenarios([]);
+    setSelectedScenario(null);
+    setScenarioError(null);
+    setWarnings([]);
+    setBaselineRun(null);
+    setRunError(null);
+    setFixes([]);
     setSelectedFixIds(new Set());
-    setCompareData(null);
-    setDesignMode('before');
-    setSimError(null);
-    setIsPlaying(false);
+    setFixError(null);
+    setPatchedDesign(null);
+    setPatchedYaml('');
+    setPatchedRun(null);
+    setAppliedFixIds([]);
+    setLastDiff(null);
+    setReportWithoutFixes(false);
     setSimTime(0);
-    apiFetch(`/api/scenarios/${selectedScenarioId}`)
-      .then((r) => r.json())
-      .then((d) => setRawScenario(d.data || null))
-      .catch((e) => console.error('Failed to load scenario', e));
-  }, [selectedScenarioId]);
-
-  // 2. Load model data when selectedModelId changes
-  useEffect(() => {
-    if (!selectedModelId) return;
-    apiFetch(`/api/models/${selectedModelId}`)
-      .then((r) => r.json())
-      .then((d) => {
-        setRawModel(d.data);
-        setRawYaml(yaml.dump(d.data, { indent: 2 }));
-        setBaselineResult(null);
-        setResult(null);
-        setRecommendations([]);
-        setAppliedFixes(new Set());
-        setAiFixes([]);
-        setSelectedFixIds(new Set());
-        setAiScenarios([]);
-        setSelectedAiScenario(null);
-        setCompareData(null);
-        setLastDiff(null);
-        setDesignMode('before');
-        if (d.data?.nodes && d.data.nodes.length > 0) {
-          const first = d.data.nodes.find((n: any) => n.type === 'service') || d.data.nodes[0];
-          setSelectedNodeId(first.id);
-        }
-        runStaticAnalysis(d.data);
-      })
-      .catch((e) => console.error('Failed to load model', e));
-  }, [selectedModelId]);
-
-  // 3. Static Analysis
-  const runStaticAnalysis = async (modelData?: any) => {
-    try {
-      const payload = modelData || rawModel || selectedModelId;
-      const res = await apiFetch(`/api/analyze`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ architecture: payload }),
-      });
-      const data = await res.json();
-      setFindings(data.findings || []);
-    } catch (e) {
-      console.error('Static analysis failed', e);
-    }
-  };
-
-  // 4a. Ask Gemini for discrete remediation proposals after any failed run.
-  const requestAiFixes = async (
-    arch: any,
-    sim: SimulationResult,
-    analysisFindings: Finding[],
-    fingerprint: string | null
-  ) => {
-    setRemediating(true);
-    setAiStatus('Gemini is diagnosing the failure…');
-    setAiFixes([]);
-    setSelectedFixIds(new Set());
-    try {
-      const res = await apiFetch('/api/ai/remediate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          architecture: arch,
-          simulation_result: sim,
-          findings: analysisFindings,
-          count: 3,
-          architecture_fingerprint: fingerprint,
-        }),
-      });
-      if (!res.ok) {
-        let message = `Server error (${res.status})`;
-        try {
-          const err = await res.json();
-          if (err?.detail) message = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
-        } catch { /* keep generic message */ }
-        throw new Error(message);
-      }
-      const data = await res.json();
-      const fixes = Array.isArray(data.fixes) ? data.fixes : [];
-      setAiFixes(fixes);
-      setAiWarnings(Array.isArray(data.warnings) ? data.warnings : []);
-      setAiStatus(`${fixes.length} discrete fix${fixes.length === 1 ? '' : 'es'} proposed — review and approve.`);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      console.error('AI remediation failed', e);
-      setAiStatus(`Remediation unavailable: ${message}`);
-    } finally {
-      setRemediating(false);
-    }
-  };
-
-  // 4b. Run Simulation (optionally with an explicit architecture + explicit scenario dict).
-  const handleRunSimulation = async (
-    modelToRun?: any,
-    scenarioOverride?: any
-  ): Promise<SimulationResult | null> => {
-    setSimulating(true);
     setIsPlaying(false);
-    setSimError(null);
-    setAiWarnings([]);
+    setSelectedNodeId(arch.nodes.find((n: any) => n.type === 'service')?.id || arch.nodes[0]?.id || '');
+    setStep('design');
     try {
-      const payload = modelToRun ?? rawModel ?? selectedModelId;
-      const arch = typeof payload === 'string'
-        ? (await (await apiFetch(`/api/models/${payload}`)).json()).data
-        : payload;
-      if (!arch) throw new Error('Could not resolve the architecture to simulate.');
-
-      // Analyze the exact model being run so fixes match what this run actually hit.
-      const analysisRes = await apiFetch(`/api/analyze`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const res = await apiFetch('/api/analyze', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ architecture: arch }),
       });
-      const analysis = analysisRes.ok ? await analysisRes.json() : { findings: [] };
-      setFindings(analysis.findings || []);
-
-      const res = await apiFetch(`/api/simulate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          architecture: arch,
-          scenario: scenarioOverride ?? rawScenario ?? selectedScenarioId,
-          seed: 42,
-        }),
-      });
-      if (!res.ok) {
-        let errMessage = `Server error (${res.status})`;
-        try {
-          const errData = await res.json();
-          if (errData && errData.detail) {
-            errMessage = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
-          }
-        } catch {
-          const raw = await res.text();
-          if (raw) errMessage = raw;
-        }
-        throw new Error(errMessage);
-      }
-      const data: SimulationResult = await res.json();
-      if (data.architecture_fingerprint) setCurrentFingerprint(data.architecture_fingerprint);
-      setResult(data);
-      setBaselineResult((prev) => prev ?? data);
-      setRecommendations(recommendFixes(arch, data, analysis.findings || []));
-      setSimTime(data.cascade?.[0]?.t ?? data.warmup_s ?? 0);
-
-      const passed = typeof (data as any).passed === 'boolean'
-        ? (data as any).passed
-        : (!data.slo_breached && data.status === 'ok');
-      if (passed) {
-        setAiFixes([]);
-        setSelectedFixIds(new Set());
-        setAiStatus('Survived the scenario — nothing to fix.');
-      } else {
-        await requestAiFixes(arch, data, analysis.findings || [], data.architecture_fingerprint ?? currentFingerprint);
-      }
-      return data;
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      console.error('Simulation run failed', e);
-      setSimError(message);
-      setAiStatus(`Simulation failed: ${message}`);
-      return null;
-    } finally {
-      setSimulating(false);
-    }
+      const d = res.ok ? await res.json() : { findings: [] };
+      setDesignFindings(Array.isArray(d.findings) ? d.findings : []);
+    } catch { setDesignFindings([]); }
   };
 
-  // 4c. Generate adversarial scenarios with Gemini, then run one directly.
-  const handleGenerateScenarios = async () => {
-    if (!rawModel) return;
-    setGeneratingScenarios(true);
-    setAiStatus('Gemini is drafting adversarial scenarios…');
-    setAiWarnings([]);
+  const loadTemplate = async (id: string) => {
+    setTemplateId(id);
+    if (!id) return;
     try {
-      const res = await apiFetch('/api/ai/adversary', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          architecture: rawModel,
-          count: 3,
-          seed: 42,
-          exclude_ids: [],
-          include_analysis: true,
-        }),
-      });
-      if (!res.ok) {
-        let message = `Server error (${res.status})`;
-        try {
-          const err = await res.json();
-          if (err?.detail) message = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
-        } catch { /* keep generic message */ }
-        throw new Error(message);
-      }
-      const data = await res.json();
-      const items = Array.isArray(data.scenarios) ? data.scenarios : [];
-      setAiScenarios(items);
-      setAiWarnings(Array.isArray(data.warnings) ? data.warnings : []);
-      setAiStatus(items.length ? `${items.length} scenarios ready — click one to break the architecture.` : 'No scenarios were generated.');
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      console.error('Scenario generation failed', e);
-      setAiStatus(`Scenario generation failed: ${message}`);
-      setAiScenarios([]);
-    } finally {
-      setGeneratingScenarios(false);
-    }
+      const res = await apiFetch(`/api/models/${id}`);
+      const d = await res.json();
+      await installDesign(d.data, 'template');
+    } catch (e) { setPromptError(errText(e)); }
   };
 
-  const handleRunAiScenario = (item: any) => {
-    if (!rawModel || !item?.scenario) return;
-    // AI ids do not exist on disk — skip the scenario-detail effect for these ids.
-    skipScenarioFetchRef.current = item.scenario_id;
-    setRawScenario(item.scenario);
-    setSelectedScenarioId(item.scenario_id);
-    setSelectedAiScenario(item);
-    setAiFixes([]);
-    setSelectedFixIds(new Set());
-    setCompareData(null);
-    setDesignMode('before');
-    handleRunSimulation(rawModel, item.scenario);
-  };
-
-  // 5. New architecture / prompt-driven modification via text-to-model.
-  const handleNewArchitecture = () => {
-    setIsCreatingNew(true);
-    setPromptText('');
-    setPromptError(null);
-    setDrawerTab('prompt');
-    setIsDrawerOpen(true);
-    setAiStatus('Draft mode: describe a new architecture below.');
-    focusSection('arch-stage');
-  };
-
-  const handleApplyPrompt = async () => {
+  const createFromPrompt = async () => {
     if (!promptText.trim()) return;
-    const mode = isCreatingNew ? 'create' : 'modify';
-    const scenarioForRun = selectedAiScenario?.scenario ?? rawScenario ?? selectedScenarioId;
-    setIsApplyingPrompt(true);
+    setGeneratingDesign(true);
     setPromptError(null);
-    setThinkingSteps([mode === 'create' ? 'Reading the brief…' : 'Reading current architecture…']);
+    setThinkingSteps(['Reading the brief…', 'Designing the topology…', 'Validating schema…']);
     try {
-      setThinkingSteps((prev) => [...prev, mode === 'create' ? 'Designing the topology…' : 'Applying the requested change…']);
-      await new Promise((resolve) => setTimeout(resolve, 260));
-
       const res = await apiFetch('/api/ai/text-to-model', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          description: promptText.trim(),
-          name: isCreatingNew ? undefined : rawModel?.name,
-          mode,
-          current_architecture: isCreatingNew ? null : rawModel,
-        }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: promptText.trim(), mode: 'create' }),
       });
-
-      setThinkingSteps((prev) => [...prev, 'Validating schema…']);
-      if (!res.ok) {
-        let message = `Server error (${res.status})`;
-        try {
-          const err = await res.json();
-          if (err?.detail) message = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
-        } catch { /* keep generic message */ }
-        throw new Error(message);
-      }
-      const data = await res.json();
-      if (!data?.architecture) throw new Error('The model compiler did not return an architecture.');
-
-      setRawModel(data.architecture);
-      setRawYaml(data.yaml || yaml.dump(data.architecture, { indent: 2 }));
-      setCurrentFingerprint(data.fingerprint ?? null);
-      setLastDiff(data.diff ?? null);
-      setAiWarnings(Array.isArray(data.warnings) ? data.warnings : []);
-      setSelectedNodeId(data.architecture.nodes?.find((n: any) => n.type === 'service')?.id || data.architecture.nodes?.[0]?.id || '');
+      if (!res.ok) throw new Error(await readError(res));
+      const d = await res.json();
+      if (!d.architecture) throw new Error('No architecture was returned.');
+      await installDesign(d.architecture, 'generated');
+      setWarnings(Array.isArray(d.warnings) ? d.warnings : []);
+      setTemplateId('');
       setPromptText('');
-      setIsDrawerOpen(false);
-      setIsCreatingNew(false);
-      setAiScenarios([]);
-      setSelectedAiScenario(null);
-      setAiFixes([]);
-      setSelectedFixIds(new Set());
-      setCompareData(null);
-      setBaselineModel(null);
-      setBaselineResult(null);
-      setDesignMode('before');
-      setAiStatus(mode === 'create'
-        ? `New architecture created · ${data.node_count ?? data.architecture.nodes?.length ?? 0} nodes.`
-        : `Change applied · ${data.diff?.changes?.length ?? 0} patch operation(s).`);
-      if (mode === 'create') setSelectedModelId('');
-
-      await runStaticAnalysis(data.architecture);
-      if (scenarioForRun) await handleRunSimulation(data.architecture, scenarioForRun);
+      setDrawerOpen(false);
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      console.error('Prompt application failed', e);
-      setPromptError(message);
-      setAiStatus(`Prompt failed: ${message}`);
+      setPromptError(errText(e));
     } finally {
-      setIsApplyingPrompt(false);
+      setGeneratingDesign(false);
       setThinkingSteps([]);
     }
   };
 
-  // 6. Apply selected AI fixes atomically, re-simulate, and compare.
+  const importFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const text = String(event.target?.result || '');
+        const parsed: any = file.name.endsWith('.json') ? JSON.parse(text) : yaml.load(text);
+        await installDesign(parsed, 'import');
+        setTemplateId('');
+      } catch (err) { setPromptError(`Import failed: ${errText(err)}`); }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  /* ---- step 2 actions ---- */
+
+  const generateScenarios = async () => {
+    if (!design) return;
+    setGeneratingScenarios(true);
+    setScenarioError(null);
+    setWarnings([]);
+    setSelectedScenario(null);
+    try {
+      const res = await apiFetch('/api/ai/adversary', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          architecture: design, count: 3, seed: 42,
+          exclude_ids: [], include_analysis: true,
+        }),
+      });
+      if (!res.ok) throw new Error(await readError(res));
+      const d = await res.json();
+      const items = Array.isArray(d.scenarios) ? d.scenarios : [];
+      setScenarios(items);
+      setWarnings(Array.isArray(d.warnings) ? d.warnings : []);
+      if (!items.length) setScenarioError('No scenarios were generated. Try again.');
+    } catch (e) {
+      setScenarioError(errText(e));
+      setScenarios([]);
+    } finally { setGeneratingScenarios(false); }
+  };
+
+  const advanceToScenarios = async () => {
+    if (!design) return;
+    setStep('scenarios');
+    if (!scenarios.length && !generatingScenarios) await generateScenarios();
+  };
+
+  /* ---- step 3 actions ---- */
+
+  const runBaseline = async () => {
+    if (!design || !selectedScenario) return;
+    setRunning(true);
+    setRunError(null);
+    setBaselineRun(null);
+    setFixes([]);
+    setSelectedFixIds(new Set());
+    setPatchedDesign(null);
+    setPatchedRun(null);
+    setReportWithoutFixes(false);
+    try {
+      const analysisRes = await apiFetch('/api/analyze', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ architecture: design }),
+      });
+      const analysis = analysisRes.ok ? await analysisRes.json() : { findings: [] };
+      const findings: Finding[] = Array.isArray(analysis.findings) ? analysis.findings : [];
+      setDesignFindings(findings);
+
+      const res = await apiFetch('/api/simulate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ architecture: design, scenario: selectedScenario.scenario, seed: 42 }),
+      });
+      if (!res.ok) throw new Error(await readError(res));
+      const result: SimulationResult = await res.json();
+      setBaselineRun(result);
+      setSimTime(result.cascade?.[0]?.t ?? result.warmup_s ?? 0);
+
+      if (!passedOf(result)) {
+        setRemediating(true);
+        const fixRes = await apiFetch('/api/ai/remediate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            architecture: design, simulation_result: result,
+            findings, count: 3,
+            architecture_fingerprint: result.architecture_fingerprint,
+            scenario: selectedScenario.scenario,
+          }),
+        });
+        if (fixRes.ok) {
+          const fd = await fixRes.json();
+          setFixes(Array.isArray(fd.fixes) ? fd.fixes : []);
+          const nextWarnings: string[] = Array.isArray(fd.warnings) ? fd.warnings : [];
+          if (fd.status === 'no_verified_fix') {
+            const bp = fd.verification?.best_partial;
+            const d = bp?.verification?.deltas || {};
+            nextWarnings.push(
+              'No verified fix found after up to 3 evidence-driven rounds. Best partial: ' +
+              `${bp?.fix_id || 'none'} ` +
+              `(error ${((d.error_rate || 0) * 100).toFixed(2)}pp, ` +
+              `out-of-SLO ${Math.round(d.seconds_out_of_slo || 0)}s).`
+            );
+          } else if (fd.status === 'unverified') {
+            nextWarnings.push('Fixes could not be verified because no scenario was available for re-simulation.');
+          }
+          setWarnings(nextWarnings);
+        } else {
+          setFixError(`Fix suggestions unavailable: ${await readError(fixRes)}`);
+        }
+        setRemediating(false);
+      }
+    } catch (e) {
+      setRunError(errText(e));
+    } finally { setRunning(false); setRemediating(false); }
+  };
+
+  /* ---- step 4 actions ---- */
+
   const toggleFix = (id: string) => {
     setSelectedFixIds((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
   };
 
-  const handleSimulateSelectedFixes = async () => {
-    if (!rawModel || !selectedFixes.length) return;
-    const scenarioForRun = currentScenarioObject ?? selectedScenarioId;
-    const beforeModel = clone(rawModel);
-    const beforeResult = result;
-    const beforeFingerprint = currentFingerprint;
-
-    setApplyingFixes(true);
-    setAiStatus(`Applying ${selectedFixes.length} fix(es) atomically…`);
-    setCompareData(null);
+  const applyFixes = async () => {
+    if (!design || !baselineRun || !selectedFixes.length) return;
+    setApplying(true);
+    setFixError(null);
     try {
-      const patch = {
-        base_fingerprint: beforeFingerprint ?? undefined,
-        ops: selectedFixes.flatMap((f) => (Array.isArray(f.patch?.ops) ? f.patch.ops : [])),
-      };
-      const res = await apiFetch('/api/architectures/patch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const patchRes = await apiFetch('/api/architectures/patch', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          architecture: rawModel,
-          patch,
+          architecture: design,
+          patch: {
+            base_fingerprint: baselineRun.architecture_fingerprint,
+            ops: selectedFixes.flatMap((f) => (Array.isArray(f.patch?.ops) ? f.patch.ops : [])),
+          },
           fix_ids: selectedFixes.map(fixIdOf),
         }),
       });
-      if (!res.ok) {
-        let message = `Server error (${res.status})`;
-        try {
-          const err = await res.json();
-          if (err?.detail) message = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
-        } catch { /* keep generic message */ }
-        throw new Error(message);
-      }
-      const data = await res.json();
-      const patched = data.architecture;
+      if (!patchRes.ok) throw new Error(await readError(patchRes));
+      const patched = await patchRes.json();
+      const newDesign = patched.architecture;
 
-      setBaselineModel(beforeModel);
-      setBaselineResult(beforeResult);
-      setRawModel(patched);
-      setRawYaml(data.yaml || yaml.dump(patched, { indent: 2 }));
-      setCurrentFingerprint(data.fingerprint ?? null);
-      setLastDiff(data.diff ?? null);
+      const simRes = await apiFetch('/api/simulate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          architecture: newDesign, scenario: selectedScenario.scenario, seed: 42,
+        }),
+      });
+      if (!simRes.ok) throw new Error(await readError(simRes));
+      const after: SimulationResult = await simRes.json();
+
+      setPatchedDesign(newDesign);
+      setPatchedYaml(patched.yaml || yaml.dump(newDesign, { indent: 2 }));
+      setPatchedRun(after);
+      setAppliedFixIds(selectedFixes.map(fixIdOf));
+      setLastDiff(patched.diff ?? null);
+      setSimTime(after.cascade?.[0]?.t ?? after.warmup_s ?? 0);
       setSelectedFixIds(new Set());
-      setDesignMode('after');
-      await runStaticAnalysis(patched);
-
-      // Re-run against the exact same scenario the baseline failed on.
-      const afterResult = await handleRunSimulation(patched, scenarioForRun);
-
-      // Build the comparison from the two runs we already performed. Re-running
-      // /api/compare here would duplicate both simulations (and can take minutes
-      // for long scenarios), which made the UI feel stalled.
-      const bStatus = String(beforeResult?.status || 'ok');
-      const aStatus = String(afterResult?.status || 'ok');
-      const rankBefore = STATUS_RANK[bStatus] ?? 1;
-      const rankAfter = STATUS_RANK[aStatus] ?? 1;
-      const statusChange = rankAfter < rankBefore ? 'better' : rankAfter > rankBefore ? 'worse' : 'same';
-      setCompareData({
-        scenarios: [{
-          scenario: scenarioLabel(scenarioForRun) || selectedScenarioId,
-          before_run: beforeResult,
-          after_run: afterResult,
-          delta: {
-            status_change: statusChange,
-            error_rate_delta: numericDelta(beforeResult?.error_rate, afterResult?.error_rate),
-            p99_delta_ms: numericDelta(beforeResult?.p99_ms, afterResult?.p99_ms),
-            recovery_delta_s: numericDelta(beforeResult?.recovery_s, afterResult?.recovery_s),
-            breach_seconds_delta: numericDelta(beforeResult?.breach_seconds, afterResult?.breach_seconds),
-            first_breach_delta_s: numericDelta(beforeResult?.first_breach_s, afterResult?.first_breach_s),
-            last_breach_delta_s: numericDelta(beforeResult?.last_breach_s, afterResult?.last_breach_s),
-          },
-        }],
-        findings: { new: [], resolved: [] },
-        summary: {
-          regressions: rankAfter > rankBefore ? 1 : 0,
-          improvements: rankAfter < rankBefore ? 1 : 0,
-          new_findings: 0,
-          resolved_findings: 0,
-        },
-      });
-      setDesignMode('compare');
-      setActiveNav('compare');
-      setAiStatus(`${selectedFixes.length} fix(es) applied — before / after ready.`);
-      focusSection('compare-sec');
+      setStep('report');
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      console.error('Applying fixes failed', e);
-      setAiStatus(`Could not apply fixes: ${message}`);
-    } finally {
-      setApplyingFixes(false);
-    }
+      setFixError(errText(e));
+    } finally { setApplying(false); }
   };
 
-  // 7. Timeline Play/Pause Loop
-  useEffect(() => {
-    if (isPlaying) {
-      playTimerRef.current = setInterval(() => {
-        setSimTime((prev) => {
-          const step = Math.max(1, Math.round(duration / 360));
-          if (prev + step >= duration) {
-            setIsPlaying(false);
-            return duration;
-          }
-          return prev + step;
-        });
-      }, 100);
-    } else {
-      if (playTimerRef.current) clearInterval(playTimerRef.current);
-    }
-    return () => {
-      if (playTimerRef.current) clearInterval(playTimerRef.current);
-    };
-  }, [isPlaying, duration]);
+  /* ---- step 5 actions ---- */
 
-  const fmtTime = (s: number) => {
-    s = Math.max(0, Math.round(s));
-    const m = Math.floor(s / 60);
-    const sec = s % 60;
-    return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
-  };
-
-  const describeEvent = (e: any) => {
-    const bits = [`${e.action} ${e.target}`];
-    if (e.replicas) bits.push(`${e.replicas} replica(s)`);
-    if (e.action === 'slow') bits.push(`${e.factor ?? 1}× latency`);
-    if (e.action === 'rate_limit') bits.push(`${e.rps} rps`);
-    if (e.mode === 'blackhole') bits.push('blackhole');
-    if (e.duration_s) bits.push(`for ${e.duration_s}s`);
-    return bits.join(' · ');
-  };
-
-  // 8. Timeline Continuous Drag-Scrubbing
-  const updateTimelineScrub = (clientX: number, target: SVGSVGElement) => {
-    const rect = target.getBoundingClientRect();
-    const x = ((clientX - rect.left) / rect.width) * 1000;
-    const newT = Math.max(0, Math.min(duration, Math.round(((x - 30) / 960) * duration)));
-    setSimTime(newT);
-  };
-
-  // 9. Graph Auto-Layout with Pinned Fallback
-  const layoutGraph = (): { nodes: LayoutNode[]; edges: LayoutEdge[]; ingressTarget: string } => {
-    if (!rawModel || !rawModel.nodes) {
-      return { nodes: [], edges: [], ingressTarget: 'lb' };
-    }
-
-    const pinned = PINNED_LAYOUTS[rawModel.name || selectedModelId] || {};
-    const ingress = rawModel.traffic?.sources?.[0]?.target || rawModel.nodes[0]?.id || 'lb';
-
-    const colX: Record<string, number> = {
-      load_balancer: 240,
-      shard_router: 440,
-      service: 470,
-      cache: 780,
-      datastore: 780,
-      external: 780,
-    };
-
-    const columns: Record<number, any[]> = { 240: [], 440: [], 470: [], 780: [] };
-    rawModel.nodes.forEach((n: any) => {
-      if (!pinned[n.id]) {
-        const x = colX[n.type] || 470;
-        if (!columns[x]) columns[x] = [];
-        columns[x].push(n);
-      }
-    });
-
-    const laidNodes: LayoutNode[] = [];
-    rawModel.nodes.forEach((n: any) => {
-      if (pinned[n.id]) {
-        laidNodes.push({
-          id: n.id,
-          label: n.id,
-          type: n.type || 'service',
-          x: pinned[n.id].x,
-          y: pinned[n.id].y,
-          replicas: n.replicas || 1,
-          concurrency: n.concurrency_per_replica || 20,
-          p50: n.latency_ms?.p50,
-          p99: n.latency_ms?.p99,
-          requires: n.startup?.requires,
-          rate_limit: n.rate_limit_rps,
-        });
-      }
-    });
-
-    Object.keys(columns).forEach((xStr) => {
-      const x = parseInt(xStr, 10);
-      const items = columns[x];
-      const count = items.length;
-      items.forEach((n: any, idx: number) => {
-        const step = 480 / Math.max(1, count + 1);
-        const y = 60 + (idx + 1) * step;
-        laidNodes.push({
-          id: n.id,
-          label: n.id,
-          type: n.type || 'service',
-          x,
-          y,
-          replicas: n.replicas || 1,
-          concurrency: n.concurrency_per_replica || 20,
-          p50: n.latency_ms?.p50,
-          p99: n.latency_ms?.p99,
-          requires: n.startup?.requires,
-          rate_limit: n.rate_limit_rps,
-        });
-      });
-    });
-
-    const laidEdges: LayoutEdge[] = (rawModel.edges || []).map((e: any) => ({
-      from: e.from,
-      to: e.to,
-      timeout_ms: e.timeout_ms || 1000,
-      attempts: e.retry?.attempts,
-      backoff: e.retry?.backoff,
-      opt: !e.required,
-    }));
-
-    return { nodes: laidNodes, edges: laidEdges, ingressTarget: ingress };
-  };
-
-  const { nodes: graphNodes, edges: graphEdges, ingressTarget } = layoutGraph();
-  const nodesById = Object.fromEntries(graphNodes.map((n) => [n.id, n]));
-
-  // Node health state calculation at current simulation scrub time (simTime)
-  const getNodeState = (nodeId: string): { state: 'ok' | 'warn' | 'down' | 'boot'; note: string; util: number } => {
-    if (!viewResult) return { state: 'ok', note: 'Nominal headroom', util: 0.25 };
-
-    // Use the most recent cascade event at or before the scrub position.
-    const latest = (viewResult.cascade ?? [])
-      .filter((c) => c.node === nodeId && c.t <= simTime)
-      .sort((a, b) => a.t - b.t)
-      .pop();
-    if (latest) {
-      const what = latest.what.toLowerCase();
-      const detail = (latest.detail ?? latest.what).toLowerCase();
-      if (what.includes('down') || detail.includes('kill') || what.includes('saturated') || detail.includes('rejecting')) {
-        return { state: 'down', note: latest.detail || latest.what, util: 1.0 };
-      }
-      if (what.includes('boot') || detail.includes('restart') || detail.includes('restore') || detail.includes('boot')) {
-        return { state: 'boot', note: latest.detail || 'Restarting / blocked', util: 0.5 };
-      }
-      if (what.includes('unhealthy') || detail.includes('slow') || detail.includes('rate limit')) {
-        return { state: 'warn', note: latest.detail || latest.what, util: 0.85 };
-      }
-      if (what.includes('up') || detail.includes('start')) {
-        return { state: 'ok', note: 'Back online', util: 0.45 };
-      }
-    }
-
-    // Node may be strained without an injected lifecycle event.
-    if (viewResult.node_errors?.[nodeId] && simTime >= (viewResult.warmup_s ?? 0)) {
-      const errCount = Object.values(viewResult.node_errors[nodeId]).reduce((a, b) => a + b, 0);
-      if (errCount > 0) {
-        return { state: 'warn', note: `${errCount.toLocaleString()} dropped requests`, util: 0.9 };
-      }
-    }
-
-    return { state: 'ok', note: 'Healthy headroom', util: 0.3 };
-  };
-
-  const computeEdgePath = (fromId: string, toId: string): string => {
-    let p = nodesById[fromId];
-    const q = nodesById[toId];
-
-    if (fromId === 'users' || !p) {
-      p = { x: 70, y: 280 } as any;
-      if (!q) return '';
-      const x1 = p.x + 30;
-      const x2 = q.x - W / 2;
-      const mx = (x1 + x2) / 2;
-      return `M${x1} ${p.y} C${mx} ${p.y} ${mx} ${q.y} ${x2} ${q.y}`;
-    }
-
-    if (!q) return '';
-    const x1 = p.x + W / 2;
-    const x2 = q.x - W / 2;
-    const mx = (x1 + x2) / 2;
-    return `M${x1} ${p.y} C${mx} ${p.y} ${mx} ${q.y} ${x2} ${q.y}`;
-  };
-
-  // 10. Legacy static recommendation (kept for manual exploration).
-  const handleApplyRecommendedFix = (fix: RecommendedFix) => {
-    if (!rawModel) return;
-    const changed = applyFix(rawModel, fix);
-    setRawModel(changed);
-    setRawYaml(yaml.dump(changed, { indent: 2 }));
-    setAppliedFixes((prev) => new Set([...prev, fix.id]));
-    setDesignMode('after');
-    runStaticAnalysis(changed);
-    handleRunSimulation(changed, currentScenarioObject ?? selectedScenarioId);
-  };
-
-  // 11. Manual YAML Spec Editor apply
-  const handleApplySpec = () => {
-    try {
-      const parsed: any = yaml.load(rawYaml);
-      if (!parsed || !parsed.nodes) {
-        alert('Invalid architecture YAML: must include a "nodes" list.');
-        return;
-      }
-      setRawModel(parsed);
-      setCurrentFingerprint(null);
-      setLastDiff(null);
-      runStaticAnalysis(parsed);
-      setIsDrawerOpen(false);
-      handleRunSimulation(parsed, currentScenarioObject ?? selectedScenarioId);
-    } catch (e: any) {
-      alert(`YAML Parse Error: ${e.message}`);
-    }
-  };
-
-  // 12. Export & Import
-  const handleExportYaml = () => {
-    const text = rawYaml || yaml.dump(rawModel, { indent: 2 });
+  const exportYaml = () => {
+    const text = patchedYaml || designYaml;
     const blob = new Blob([text], { type: 'text/yaml' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${rawModel?.name || selectedModelId || 'architecture'}.yaml`;
+    a.download = `${(patchedDesign || design)?.name || 'architecture'}.yaml`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const content = event.target?.result as string;
-        let parsed: any;
-        if (file.name.endsWith('.json')) {
-          parsed = JSON.parse(content);
-        } else {
-          parsed = yaml.load(content);
-        }
-        if (!parsed || !parsed.nodes) {
-          setImportStatus('Error: Architecture file must contain a "nodes" section.');
-          return;
-        }
-        setRawModel(parsed);
-        setRawYaml(yaml.dump(parsed, { indent: 2 }));
-        setCurrentFingerprint(null);
-        setLastDiff(null);
-        setImportStatus(`Successfully loaded "${parsed.name || file.name}"!`);
-        runStaticAnalysis(parsed);
-        handleRunSimulation(parsed, currentScenarioObject ?? selectedScenarioId);
-      } catch (err: any) {
-        setImportStatus(`Failed to parse file: ${err.message}`);
-      }
-    };
-    reader.readAsText(file);
+  const startOver = () => {
+    setStep('design');
+    setDesign(null);
+    setDesignYaml('');
+    setDesignSource(null);
+    setTemplateId('');
+    setScenarios([]);
+    setSelectedScenario(null);
+    setBaselineRun(null);
+    setFixes([]);
+    setSelectedFixIds(new Set());
+    setPatchedDesign(null);
+    setPatchedRun(null);
+    setAppliedFixIds([]);
+    setLastDiff(null);
+    setReportWithoutFixes(false);
+    setDesignFindings([]);
+    setWarnings([]);
+    setScenarioError(null);
+    setRunError(null);
+    setFixError(null);
+    setPromptError(null);
+    setSelectedNodeId('');
+    setSimTime(0);
+    setIsPlaying(false);
   };
 
-  // ---- Compare panel helpers ----
-  const metric = (run: any, keys: string[]): number | null => {
-    for (const k of keys) {
-      const v = run?.[k];
-      if (typeof v === 'number') return v;
-    }
+  /* ---------------------------------------------------------------- */
+  /* Report comparison metrics                                        */
+  /* ---------------------------------------------------------------- */
+  const metric = (r: any, keys: string[]): number | null => {
+    for (const k of keys) if (typeof r?.[k] === 'number') return r[k];
     return null;
   };
   const fmtPct = (v: number | null) => v === null ? '—' : `${(v * 100).toFixed(1)}%`;
   const fmtMs = (v: number | null) => v === null ? '—' : `${Math.round(v)}ms`;
   const fmtSecs = (v: number | null) => v === null ? '—' : `${Math.round(v)}s`;
-  const deltaText = (b: number | null, a: number | null, unit: 'pp' | 'ms' | 's') => {
+  const delta = (b: number | null, a: number | null, unit: 'pp' | 'ms' | 's') => {
     if (b === null || a === null) return '—';
     const d = a - b;
     if (Math.abs(d) < 1e-9) return 'no change';
-    const magnitude = unit === 'pp' ? `${(Math.abs(d) * 100).toFixed(1)}pp` : `${Math.round(Math.abs(d))}${unit}`;
-    return `${d < 0 ? '▼' : '▲'} ${magnitude}`;
+    const mag = unit === 'pp' ? `${(Math.abs(d) * 100).toFixed(1)}pp` : `${Math.round(Math.abs(d))}${unit}`;
+    return `${d < 0 ? '▼' : '▲'} ${mag}`;
   };
-
-  const cmpScenario = compareData?.scenarios?.[0] ?? {};
-  const statusDelta = cmpScenario?.delta?.status_change;
-  const verdictDelta = statusDelta === 'better' ? 'improved' : statusDelta === 'worse' ? 'regressed' : statusDelta === 'same' ? 'same verdict' : (currentPassed === true ? 'survived' : '—');
-  const beforeRun = cmpScenario.before_run ?? compareData?.before ?? baselineResult;
-  const afterRun = cmpScenario.after_run ?? compareData?.after ?? result;
-  const bErr = metric(beforeRun, ['error_rate', 'peak_error_rate']);
-  const aErr = metric(afterRun, ['error_rate', 'peak_error_rate']);
-  const bP99 = metric(beforeRun, ['p99_ms']);
-  const aP99 = metric(afterRun, ['p99_ms']);
-  const bRec = metric(beforeRun, ['recovery_s']);
-  const aRec = metric(afterRun, ['recovery_s']);
-  const bBreach = metric(beforeRun, ['breach_seconds', 'first_breach_s']);
-  const aBreach = metric(afterRun, ['breach_seconds', 'first_breach_s']);
-
-  const compareMetrics = [
-    { label: 'Verdict', before: cellText(beforeRun?.status), after: cellText(afterRun?.status), delta: verdictDelta },
-    { label: 'Error rate', before: fmtPct(bErr), after: fmtPct(aErr), delta: deltaText(bErr, aErr, 'pp') },
-    { label: 'p99 latency', before: fmtMs(bP99), after: fmtMs(aP99), delta: deltaText(bP99, aP99, 'ms') },
-    { label: 'Recovery', before: fmtSecs(bRec), after: fmtSecs(aRec), delta: deltaText(bRec, aRec, 's') },
-    { label: 'First breach', before: fmtSecs(bBreach), after: fmtSecs(aBreach), delta: deltaText(bBreach, aBreach, 's') },
+  const deltaTone = (b: number | null, a: number | null): 'good' | 'bad' | 'flat' => {
+    if (b === null || a === null || Math.abs(a - b) < 1e-9) return 'flat';
+    return a < b ? 'good' : 'bad';
+  };
+  const finalRun = patchedRun ?? baselineRun;
+  const compareRows = [
+    { label: 'Verdict', before: baselineRun?.status ?? '—', after: finalRun?.status ?? '—', change: patchedRun ? (patchedPassed && baselinePassed === false ? 'improved' : 'unchanged') : '—', tone: patchedPassed && baselinePassed === false ? 'good' as const : 'flat' as const },
+    { label: 'Error rate', before: fmtPct(metric(baselineRun, ['error_rate'])), after: fmtPct(metric(finalRun, ['error_rate'])), change: delta(metric(baselineRun, ['error_rate']), metric(finalRun, ['error_rate']), 'pp'), tone: deltaTone(metric(baselineRun, ['error_rate']), metric(finalRun, ['error_rate'])) },
+    { label: 'p99 latency', before: fmtMs(metric(baselineRun, ['p99_ms'])), after: fmtMs(metric(finalRun, ['p99_ms'])), change: delta(metric(baselineRun, ['p99_ms']), metric(finalRun, ['p99_ms']), 'ms'), tone: deltaTone(metric(baselineRun, ['p99_ms']), metric(finalRun, ['p99_ms'])) },
+    { label: 'Time out of SLO', before: fmtSecs(metric(baselineRun, ['seconds_out_of_slo', 'breach_seconds'])), after: fmtSecs(metric(finalRun, ['seconds_out_of_slo', 'breach_seconds'])), change: delta(metric(baselineRun, ['seconds_out_of_slo', 'breach_seconds']), metric(finalRun, ['seconds_out_of_slo', 'breach_seconds']), 's'), tone: deltaTone(metric(baselineRun, ['seconds_out_of_slo', 'breach_seconds']), metric(finalRun, ['seconds_out_of_slo', 'breach_seconds'])) },
+    { label: 'Post-fault error rate', before: fmtPct(metric(baselineRun, ['post_fault_error_rate'])), after: fmtPct(metric(finalRun, ['post_fault_error_rate'])), change: delta(metric(baselineRun, ['post_fault_error_rate']), metric(finalRun, ['post_fault_error_rate']), 'pp'), tone: deltaTone(metric(baselineRun, ['post_fault_error_rate']), metric(finalRun, ['post_fault_error_rate'])) },
+    { label: 'Recovery', before: fmtSecs(metric(baselineRun, ['recovery_s'])), after: fmtSecs(metric(finalRun, ['recovery_s'])), change: delta(metric(baselineRun, ['recovery_s']), metric(finalRun, ['recovery_s']), 's'), tone: deltaTone(metric(baselineRun, ['recovery_s']), metric(finalRun, ['recovery_s'])) },
   ];
+  const diffChanges: any[] = Array.isArray(lastDiff?.changes) ? lastDiff.changes : [];
 
-  const findingsNew = Array.isArray(compareData?.findings?.new) ? compareData.findings.new : [];
-  const findingsResolved = Array.isArray(compareData?.findings?.resolved) ? compareData.findings.resolved : [];
-  const diffRows: any[] = findingsNew.length || findingsResolved.length
-    ? [
-        ...findingsNew.map((x: any) => ({
-          kind: 'new',
-          path: typeof x === 'string' ? x : (x.target || x.path || x.rule || 'finding'),
-          before: '—',
-          after: typeof x === 'string' ? 'introduced' : (x.message || x.fix || 'introduced'),
-        })),
-        ...findingsResolved.map((x: any) => ({
-          kind: 'resolved',
-          path: typeof x === 'string' ? x : (x.target || x.path || x.rule || 'finding'),
-          before: typeof x === 'string' ? 'present' : (x.message || 'present'),
-          after: '—',
-        })),
-      ]
-    : (Array.isArray(lastDiff?.changes)
-        ? lastDiff.changes.map((c: any) => ({ kind: c.op || 'changed', path: c.path || '—', before: c.before, after: c.after }))
-        : []);
+  /* ---------------------------------------------------------------- */
+  /* Executive dashboard derived values                               */
+  /* ---------------------------------------------------------------- */
+  const readiness = (r: SimulationResult | null): number | null => {
+    if (!r) return null;
+    const errPp = (r.error_rate || 0) * 100;
+    const breach = r.breach_seconds || 0;
+    const unrecovered = r.status === 'ok' || r.status === 'degraded' ? 0 : (r.recovery_s || 120);
+    return Math.max(0, Math.min(100, Math.round(100 - errPp * 3 - breach * 0.3 - unrecovered * 0.08)));
+  };
+  const beforeScore = readiness(baselineRun);
+  const afterScore = readiness(finalRun);
+  const severityCounts = ['critical', 'high', 'medium', 'low'].map((sev) => ({
+    sev,
+    count: designFindings.filter((f) => String(f.severity || '').toLowerCase() === sev).length,
+  }));
+  const totalFindings = severityCounts.reduce((n, s) => n + s.count, 0);
+  const scenarioEvents: any[] = selectedScenario?.scenario?.events ?? [];
+  const scenarioTargets: string[] = Array.isArray(selectedScenario?.target_nodes) ? selectedScenario.target_nodes : [];
 
-  const selectedNode = nodesById[selectedNodeId] || graphNodes[0];
-  const selectedNodeState = selectedNode ? getNodeState(selectedNode.id) : null;
+  // Shared report fragments, reused by the Report step and by the printable
+  // appendix on the Dashboard screen so one PDF contains the whole story.
+  const reportHead = () => (
+    <div className="report-head">
+      <div className="micro">Pre-mortem report · seed 42</div>
+      <h1>{design?.name}</h1>
+      <p>{scenarioName(selectedScenario)} · {new Date().toLocaleString()}</p>
+    </div>
+  );
+
+  const reportDetail = () => (
+    <>
+      <div className="report-banner">
+        <div>
+          <span className="micro">Original design</span>
+          <h3 style={{ color: statusColor(baselineRun?.status) }}>{verdictText(baselineRun)}</h3>
+        </div>
+        <ArrowRight className="w-5 h-5" />
+        <div>
+          <span className="micro">{patchedRun ? 'With fixes applied' : 'Final result'}</span>
+          <h3 style={{ color: patchedRun ? statusColor(patchedRun.status) : statusColor(baselineRun?.status) }}>
+            {verdictText(patchedRun || baselineRun)}
+          </h3>
+        </div>
+        <span className={`status-pill ${patchedPassed === true ? 'success' : patchedPassed === false ? 'error' : ''}`}>
+          {patchedRun ? (patchedPassed && baselinePassed === false ? 'fixed' : patchedPassed ? 'still survives' : 'still failing') : reportWithoutFixes ? 'no fixes applied' : 'no fix needed'}
+        </span>
+      </div>
+
+      <div className="card">
+        <h2>Measured impact <span className="chip">same scenario · same seed</span></h2>
+        <div className="report-table">
+          <div className="report-row head"><span>Metric</span><span>Original</span><span>{patchedRun ? 'With fixes' : 'Final'}</span><span>Change</span></div>
+          {compareRows.map((r, i) => (
+            <div className="report-row" key={i}>
+              <span>{r.label}</span><span>{cellText(r.before)}</span>
+              <span><b>{cellText(r.after)}</b></span><span className={`delta ${r.tone}`}>{r.change}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {patchedRun && (
+        <Timeline result={patchedRun} compareTo={baselineRun} simTime={simTime}
+          onScrub={(t) => { setIsPlaying(false); setSimTime(t); }} isPlaying={isPlaying}
+          onPlay={() => setIsPlaying(!isPlaying)} scenario={selectedScenario} />
+      )}
+
+      <div className="report-two-col">
+        <div className="card">
+          <h2>Changes applied <span className="chip">{appliedFixIds.length} fix{appliedFixIds.length === 1 ? '' : 'es'}</span></h2>
+          {appliedFixIds.length ? (
+            <ul className="report-list">{appliedFixIds.map((id, i) => <li key={i}>{fixes.find((f) => fixIdOf(f) === id)?.recommended_pattern || id}</li>)}</ul>
+          ) : <p className="insp-empty">{reportWithoutFixes ? 'No fixes were applied — this is the original design.' : 'No fixes were needed — the original design survived.'}</p>}
+        </div>
+        <div className="card">
+          <h2>Architecture diff <span className="chip">{diffChanges.length} change{diffChanges.length === 1 ? '' : 's'}</span></h2>
+          {diffChanges.length ? (
+            <div className="diff-table-wrap"><table className="diff-table">
+              <thead><tr><th>Op</th><th>Path</th><th>After</th></tr></thead>
+              <tbody>{diffChanges.map((c, i) => (
+                <tr key={i}><td>{cellText(c.op)}</td><td className="mono-cell">{cellText(c.path)}</td><td className="mono-cell">{cellText(c.value ?? c.after ?? '')}</td></tr>
+              ))}</tbody>
+            </table></div>
+          ) : <p className="insp-empty">No structural changes — behaviour changed through the same topology.</p>}
+        </div>
+      </div>
+    </>
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Render                                                           */
+  /* ---------------------------------------------------------------- */
+  const activeTitle = STEPS.find((s) => s.key === step)?.label ?? '';
 
   return (
     <div className="app">
-      {/* ===== FIXED LEFT SIDEBAR ===== */}
+      {/* ---------- Sidebar: one step at a time ---------- */}
       <aside className="sidebar">
-        <div className="brand">
-          <div className="logo">V</div>
-          <span>VENESSA</span>
-        </div>
-        <div className="micro sidebar-label">Workbench</div>
-        <nav className="side-nav" aria-label="Sections">
-          <button type="button" className={`nav-item ${activeNav === 'architecture' ? 'active' : ''}`} onClick={() => { setActiveNav('architecture'); focusSection('arch-stage', 'before'); }}>
-            <Layers className="w-3.5 h-3.5" /> Architecture
-          </button>
-          <button type="button" className={`nav-item ${activeNav === 'scenarios' ? 'active' : ''}`} onClick={() => { setActiveNav('scenarios'); focusSection('scenarios-sec'); }}>
-            <Zap className="w-3.5 h-3.5" /> Scenarios
-          </button>
-          <button type="button" className={`nav-item ${activeNav === 'simulate' ? 'active' : ''}`} onClick={() => { setActiveNav('simulate'); focusSection('verdict-sec'); }}>
-            <Play className="w-3.5 h-3.5" /> Simulate
-          </button>
-          <button type="button" className={`nav-item ${activeNav === 'fixes' ? 'active' : ''}`} onClick={() => { setActiveNav('fixes'); focusSection('fixes-sec'); }}>
-            <ShieldAlert className="w-3.5 h-3.5" /> Fixes
-            {aiFixes.length > 0 && <span className="nav-count">{aiFixes.length}</span>}
-          </button>
-          <button type="button" className={`nav-item ${activeNav === 'compare' ? 'active' : ''}`} onClick={() => { setActiveNav('compare'); focusSection('compare-sec', 'compare'); }}>
-            <GitCompare className="w-3.5 h-3.5" /> Compare
-          </button>
+        <div className="brand"><div className="logo">V</div><span>VENESSA</span></div>
+        <div className="micro sidebar-label">Pre-mortem workflow</div>
+        <nav className="side-nav stepper" aria-label="Workflow steps">
+          {STEPS.map((s, i) => {
+            const state = stepState(s.key);
+            return (
+              <button key={s.key} type="button"
+                className={`nav-item step-item ${state}`}
+                disabled={state === 'locked'}
+                onClick={() => goToStep(s.key)}>
+                <span className="step-marker">
+                  {state === 'done' ? <Check className="w-3 h-3" /> : state === 'active' ? <ArrowRight className="w-3 h-3" /> : <span>{i + 1}</span>}
+                </span>
+                <span className="step-copy"><b>{s.label}</b><small>{s.hint}</small></span>
+              </button>
+            );
+          })}
         </nav>
         <div className="sidebar-bottom context-card">
-          <div className="micro">Active model</div>
-          <b className="model-name">{rawModel?.name || selectedModelId || 'untitled architecture'}</b>
+          <div className="micro">Design in scope</div>
+          <b className="model-name">{design?.name || 'No design chosen'}</b>
           <div className="sidebar-stats">
-            <span>{rawModel?.nodes?.length ?? 0} nodes</span>
-            <span>{rawModel?.edges?.length ?? 0} edges</span>
+            <span>{design?.nodes?.length ?? 0} nodes</span>
+            <span>{design?.edges?.length ?? 0} edges</span>
           </div>
-          <div className="micro">fp {fpShort}</div>
+          {patchedDesign && <span className="status-pill success">fixes applied</span>}
+          {!patchedDesign && design && <span className="status-pill">original design</span>}
         </div>
       </aside>
 
-      {/* ===== TOP COMMAND STRIP ===== */}
+      {/* ---------- Top bar: only stage context + primary action ---------- */}
       <header className="top">
         <div className="command-group">
-          <div className="pick">
-            <small>Model</small>
-            <select value={selectedModelId} onChange={(e) => setSelectedModelId(e.target.value)}>
-              {!selectedModelId && <option value="">{rawModel?.name || 'generated architecture'}</option>}
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>{m.name || m.id}</option>
-              ))}
-            </select>
-          </div>
-          <span className="sep">/</span>
-          <div className="pick">
-            <small>Scenario</small>
-            <select value={selectedScenarioId} onChange={(e) => setSelectedScenarioId(e.target.value)}>
-              {selectedAiScenario && <option value={selectedScenarioId}>{scenarioLabel(selectedAiScenario.scenario) || selectedScenarioId}</option>}
-              {scenarios.map((s) => (
-                <option key={s.id} value={s.id}>{s.name || s.id}</option>
-              ))}
-            </select>
-          </div>
-          <span className="status-pill">seed 42</span>
+          <span className="stage-index">{String(stepIndex(step) + 1).padStart(2, '0')} / 06</span>
+          <div><small className="micro">Stage</small><b className="stage-title">{activeTitle}</b></div>
         </div>
-
-        <div className="spacer"></div>
-
-        <div className="seg" role="group" aria-label="Design version">
-          <button type="button" className={designMode === 'before' ? 'active' : ''} onClick={() => setDesignMode('before')}>Before</button>
-          <button type="button" className={designMode === 'after' ? 'active' : ''} onClick={() => setDesignMode('after')}>After</button>
-          <button type="button" className={designMode === 'compare' ? 'active' : ''} onClick={() => { setDesignMode('compare'); setActiveNav('compare'); }}>Compare</button>
-        </div>
-
-        <button type="button" className="action-btn" onClick={handleNewArchitecture}>
-          <Plus className="w-3.5 h-3.5" /><span>New architecture</span>
-        </button>
-        <button type="button" className="action-btn" onClick={() => { setIsCreatingNew(false); setDrawerTab('prompt'); setIsDrawerOpen(true); }}>
-          <Sparkles className="w-3.5 h-3.5 text-accent" /><span>Prompt &amp; Edit</span>
-        </button>
-        <button type="button" className="action-btn icon-only" onClick={handleExportYaml} title="Export YAML"><Download className="w-3.5 h-3.5" /></button>
-        <button type="button" className="action-btn icon-only" onClick={() => fileInputRef.current?.click()} title="Import YAML / JSON"><Upload className="w-3.5 h-3.5" /></button>
-        <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept=".yaml,.yml,.json" style={{ display: 'none' }} />
-
-        <button type="button" className="run" onClick={() => handleRunSimulation(rawModel, currentScenarioObject ?? selectedScenarioId)} disabled={simulating}>
-          {simulating ? <><RefreshCw className="w-3.5 h-3.5 animate-spin" /><span>Simulating…</span></> : <><Play className="w-3.5 h-3.5" /><span>Run scenario</span></>}
-        </button>
+        <div className="spacer" />
+        {design && <span className="status-pill">{design.name}</span>}
+        {selectedScenario && <span className="status-pill accent">{scenarioName(selectedScenario)}</span>}
+        {step === 'run' && !baselineRun && (
+          <button type="button" className="run" onClick={runBaseline} disabled={running || !selectedScenario}>
+            {running ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+            {running ? 'Running…' : 'Run stress test'}
+          </button>
+        )}
+        {(step === 'report' || step === 'dashboard') && (
+          <>
+            <button type="button" className="action-btn" onClick={exportYaml}><Download className="w-3.5 h-3.5" /> Export final YAML</button>
+            <button type="button" className="run" onClick={() => window.print()}><FileText className="w-3.5 h-3.5" /> Save as PDF</button>
+          </>
+        )}
       </header>
 
-      {/* ===== WORKBENCH ===== */}
-      <main className="main workbench">
-        {/* LEFT RAIL */}
-        <aside className="stack left">
-          <section className="card" id="verdict-sec" aria-labelledby="vh">
-            <h2 id="vh"><span>Verdict</span><span className="chip">{designMode}</span></h2>
-            <div className="verdict">
-              <span className="dot" style={{ background: viewResult?.status === 'ok' ? 'var(--green)' : viewResult?.status === 'degraded' || viewResult?.status === 'slow_recovery' ? 'var(--orange)' : 'var(--red)' }} />
-              <div>
-                <h3 id="vTitle">
-                  {viewResult
-                    ? viewResult.status === 'ok'
-                      ? 'Survives nominal load'
-                      : viewResult.status === 'degraded' || viewResult.status === 'slow_recovery'
-                      ? 'Degraded, recovered'
-                      : 'Catastrophic outage'
-                    : 'Awaiting simulation'}
-                </h3>
-                <p id="vText">
-                  {viewResult
-                    ? viewResult.slo_breached
-                      ? `Breached SLO for ${viewResult.breach_seconds || 0}s during the incident.`
-                      : 'Remained within the target SLO envelope.'
-                    : 'Pick a scenario and run it to see the verdict.'}
-                </p>
-              </div>
+      <main className="main stage-main">
+        {/* ============ STEP 1 — DESIGN ============ */}
+        {step === 'design' && (
+          <div className="stage-content">
+            <div className="stage-intro">
+              <h1>Start with a design</h1>
+              <p>Pick a reference architecture, describe a new one, or import a spec. Nothing runs until you say so.</p>
             </div>
 
-            {simError && <p className="sim-error" role="alert">Simulation failed: {simError}</p>}
-            {aiStatus && <div className={`insight-card ${aiStatus.startsWith('Prompt failed') || aiStatus.startsWith('Could not') || aiStatus.startsWith('Scenario generation failed') ? 'error' : ''}`}>
-              <span className="micro"> Gemini trace</span>
-              <span>{aiStatus}</span>
-            </div>}
-            {aiWarnings.length > 0 && (
-              <div className="insight-card warn">
-                <span className="micro">Warnings</span>
-                {aiWarnings.map((w, i) => <span key={i}>{typeof w === 'string' ? w : JSON.stringify(w)}</span>)}
+            {!design ? (
+              <div className="choice-grid">
+                <button type="button" className="choice-card" onClick={() => document.getElementById('template-list')?.scrollIntoView({ behavior: 'smooth' })}>
+                  <span className="choice-icon"><Layers className="w-5 h-5" /></span>
+                  <h3>Use an existing design</h3>
+                  <p>Choose one of the bundled reference architectures and stress-test it immediately.</p>
+                  <span className="choice-cta">Browse templates <ChevronRight className="w-3.5 h-3.5" /></span>
+                </button>
+                <button type="button" className="choice-card accent-choice" onClick={() => { setPromptError(null); setDrawerOpen(true); }}>
+                  <span className="choice-icon"><Sparkles className="w-5 h-5" /></span>
+                  <h3>Create a new design</h3>
+                  <p>Describe your system in plain English. Gemini compiles it into a simulation-ready model.</p>
+                  <span className="choice-cta">Describe architecture <ChevronRight className="w-3.5 h-3.5" /></span>
+                </button>
+                <button type="button" className="choice-card" onClick={() => fileRef.current?.click()}>
+                  <span className="choice-icon"><Upload className="w-5 h-5" /></span>
+                  <h3>Import a spec</h3>
+                  <p>Already have a YAML or JSON architecture file? Load it as-is.</p>
+                  <span className="choice-cta">Choose file <ChevronRight className="w-3.5 h-3.5" /></span>
+                </button>
+                <input ref={fileRef} type="file" accept=".yaml,.yml,.json" onChange={importFile} style={{ display: 'none' }} />
               </div>
+            ) : (
+              <>
+                <div className="design-confirm">
+                  <div>
+                    <span className={`status-pill ${designSource === 'generated' ? 'accent' : ''}`}>
+                      {designSource === 'generated' ? 'generated by Gemini' : designSource === 'import' ? 'imported spec' : 'reference template'}
+                    </span>
+                    <h2>{design.name}</h2>
+                    <p>{design.nodes?.length ?? 0} nodes · {design.edges?.length ?? 0} edges · {designFindings.length} static weak spots</p>
+                  </div>
+                  <button type="button" className="ghost" onClick={startOver}><X className="w-3.5 h-3.5" /> Change design</button>
+                </div>
+                {warnings.length > 0 && <div className="insight-card warn">{warnings.map((w, i) => <span key={i}>{cellText(w)}</span>)}</div>}
+                {designFindings.length > 0 && (
+                  <div className="card findings-card">
+                    <h2>Static weak spots <span className="chip">{designFindings.length}</span></h2>
+                    <div className="finding-grid">
+                      {designFindings.slice(0, 6).map((f, i) => (
+                        <div key={i} className="finding"><span className={`status-pill ${f.severity}`}>{f.severity}</span><b>{f.target}</b><span>{f.message}</span></div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <ArchitectureGraph arch={design} result={null} simTime={0}
+                  selectedNodeId={selectedNodeId} onSelectNode={setSelectedNodeId} label="Design preview" />
+                <div className="stage-actions">
+                  <span className="micro">Next: Gemini proposes failures specific to this design.</span>
+                  <button type="button" className="run" onClick={advanceToScenarios}>
+                    Continue to stress tests <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </>
             )}
 
-            <div className="kpis">
-              <div className="kpi"><small>Peak error rate</small><b>{viewResult ? `${(viewResult.error_rate * 100).toFixed(1)}%` : '–'}</b></div>
-              <div className="kpi"><small>Time out of SLO</small><b>{viewResult?.breach_seconds !== undefined ? `${viewResult.breach_seconds}s` : '–'}</b></div>
-              <div className="kpi"><small>Recovery</small><b>{viewResult?.status === 'ok' ? 'Instant' : viewResult?.recovery_s ? `${viewResult.recovery_s.toFixed(0)}s` : 'Failed'}</b></div>
-              <div className="kpi"><small>Failed requests</small><b>{viewResult ? Math.round(viewResult.requests * viewResult.error_rate).toLocaleString() : '–'}</b></div>
-            </div>
-          </section>
+            {!design && models.length > 0 && (
+              <div className="card template-card" id="template-list">
+                <h2>Reference architectures <span className="chip">{models.length}</span></h2>
+                <div className="template-list">
+                  {models.map((m) => (
+                    <button key={m.id} type="button"
+                      className={`template-row ${templateId === m.id ? 'sel' : ''}`}
+                      onClick={() => loadTemplate(m.id)}>
+                      <span className="radio">{templateId === m.id && <Check className="w-3 h-3" />}</span>
+                      <span><b>{m.name || m.id}</b><small>{m.nodes} nodes · {m.edges} edges</small></span>
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {promptError && <div className="insight-card error" role="alert">{promptError}</div>}
+          </div>
+        )}
 
-          <section className="card" id="scenarios-sec" aria-labelledby="sh">
-            <h2 id="sh"><span>Scenario events</span><span className="chip">{fmtTime(duration)}</span></h2>
-            <ul className="events">
-              {(rawScenario?.traffic?.ramp ?? []).map((r: any, i: number) => (
-                <li key={`ramp-${i}`}>
-                  <time>{fmtTime(r.at_s)}</time>
-                  <span className="tag load">load</span>
-                  <span>Traffic ramps to {r.multiplier}×{r.ramp_s ? ` over ${r.ramp_s}s` : ''}</span>
-                </li>
-              ))}
-              {(rawScenario?.events ?? []).map((e: any, i: number) => (
-                <li key={`event-${i}`}>
-                  <time>{fmtTime(e.at_s)}</time>
-                  <span className={`tag ${e.action}`}>{e.action}</span>
-                  <span>{describeEvent(e)}</span>
-                </li>
-              ))}
-              {!rawScenario && <li><span>Loading scenario…</span></li>}
-              {rawScenario && (rawScenario.traffic?.ramp ?? []).length === 0 && (rawScenario.events ?? []).length === 0 && (
-                <li><span>No injected failures — nominal steady-state load</span></li>
+        {/* ============ STEP 2 — STRESS TESTS ============ */}
+        {step === 'scenarios' && (
+          <div className="stage-content">
+            <div className="stage-intro">
+              <h1>Choose a stress test</h1>
+              <p>These failure scenarios were generated for <b>{design?.name}</b>. Select one to run it.</p>
+            </div>
+
+            <div className="card">
+              <h2>
+                Adversarial scenarios <span className="chip">{scenarios.length} generated</span>
+                <button type="button" className="tiny-btn" onClick={generateScenarios} disabled={generatingScenarios}>
+                  <RefreshCw className={`w-3 h-3 ${generatingScenarios ? 'animate-spin' : ''}`} />
+                  {generatingScenarios ? 'Generating…' : 'Regenerate'}
+                </button>
+              </h2>
+
+              {generatingScenarios && (
+                <div className="thinking">
+                  <div className="thinking-step">Reading architecture fingerprint…</div>
+                  <div className="thinking-step">Searching for metastable failure paths…</div>
+                  <div className="thinking-step">Validating adversarial scenarios…</div>
+                </div>
               )}
-            </ul>
-          </section>
+              {scenarioError && <div className="insight-card error">{scenarioError}</div>}
+              {warnings.length > 0 && <div className="insight-card warn">{warnings.map((w, i) => <span key={i}>{cellText(w)}</span>)}</div>}
 
-          <section className="card" id="adversary-sec" aria-labelledby="ah">
-            <h2 id="ah">
-              <span>AI adversary</span>
-              <button type="button" className="tiny-btn" onClick={handleGenerateScenarios} disabled={generatingScenarios || !rawModel}>
-                <Zap className="w-3 h-3" />{generatingScenarios ? 'Thinking…' : 'Generate 3'}
-              </button>
-            </h2>
-
-            {generatingScenarios && (
-              <div className="thinking">
-                <div className="thinking-step">Reading architecture fingerprint…</div>
-                <div className="thinking-step">Searching for metastable failure paths…</div>
-                <div className="thinking-step">Validating adversarial scenarios…</div>
-              </div>
-            )}
-
-            {aiScenarios.length > 0 && (
-              <div className="scenario-list">
-                {aiScenarios.map((item: any, idx: number) => {
-                  const isSelected = selectedAiScenario?.scenario_id === item.scenario_id;
-                  const targets = Array.isArray(item.target_nodes) ? item.target_nodes.join(', ') : '';
-                  const severity = String(item.severity || item.hypothesis?.severity || (idx === 0 ? 'high' : 'medium')).toLowerCase();
+              <div className="scenario-grid">
+                {scenarios.map((item: any, i: number) => {
+                  const sc = item.scenario || {};
+                  const isSel = selectedScenario?.scenario_id === item.scenario_id;
+                  const targets: string[] = Array.isArray(item.target_nodes) ? item.target_nodes : [];
+                  const events: any[] = sc.events || [];
                   return (
-                    <button
-                      type="button"
-                      key={item.scenario_id || idx}
-                      className={`scenario-card ${isSelected ? 'sel' : ''}`}
-                      onClick={() => handleRunAiScenario(item)}
-                    >
+                    <button key={item.scenario_id || i} type="button"
+                      className={`scenario-choice ${isSel ? 'sel' : ''}`}
+                      onClick={() => setSelectedScenario(item)}>
                       <div className="scenario-top">
-                        <span className={`status-pill ${severity}`}>{severity}</span>
-                        <span className="micro">#{String(idx + 1).padStart(2, '0')}</span>
+                        <span className="status-pill accent">test {String(i + 1).padStart(2, '0')}</span>
+                        {item.source === 'fallback' && <span className="status-pill warn">fallback</span>}
+                        {isSel && <span className="status-pill success"><Check className="w-3 h-3" /> selected</span>}
                       </div>
-                      <b>{scenarioLabel(item.scenario) || `Scenario ${idx + 1}`}</b>
-                      <p>{item.hypothesis || item.rationale || 'Gemini adversarial hypothesis'}</p>
-                      {targets && <div className="micro">targets · {targets}</div>}
-                      <span className="run-link"><Play className="w-3 h-3" /> Run to verify</span>
+                      <h3>{sc.name || `Scenario ${i + 1}`}</h3>
+                      <p>{item.hypothesis || sc.description || item.rationale || 'Adversarial failure hypothesis'}</p>
+                      <div className="scenario-meta">
+                        <span>{events.length} injected event{events.length === 1 ? '' : 's'}</span>
+                        <span>{sc.duration_s ?? '—'}s window</span>
+                        {targets.length > 0 && <span>targets · {targets.join(', ')}</span>}
+                      </div>
                     </button>
                   );
                 })}
               </div>
+              {!generatingScenarios && scenarios.length === 0 && (
+                <p className="insp-empty">No scenarios available. Use Regenerate to try again.</p>
+              )}
+            </div>
+
+            {selectedScenario && (
+              <div className="card">
+                <h2>What this test injects <span className="chip">{scenarioName(selectedScenario)}</span></h2>
+                <ul className="events">
+                  {(selectedScenario.scenario?.traffic?.ramp ?? []).map((r: any, i: number) => (
+                    <li key={`r${i}`}><time>{fmtTime(r.at_s)}</time><span className="tag load">load</span><span>Traffic ramps to {r.multiplier}×{r.ramp_s ? ` over ${r.ramp_s}s` : ''}</span></li>
+                  ))}
+                  {(selectedScenario.scenario?.events ?? []).map((e: any, i: number) => (
+                    <li key={`e${i}`}><time>{fmtTime(e.at_s)}</time><span className={`tag ${e.action}`}>{e.action}</span><span>{describeEvent(e)}</span></li>
+                  ))}
+                </ul>
+              </div>
             )}
 
-            <div className="dashed" />
-            <div className="micro section-label">Disk scenarios</div>
-            <div className="adv">
-              {scenarios.map((s) => {
-                const tried = result?.scenario === (s.name || s.id);
-                const verdict = tried ? (result?.slo_breached ? 'breaks' : 'survives') : 'not run';
-                return (
-                  <div
-                    key={s.id}
-                    className={`adv-row ${selectedScenarioId === s.id && !selectedAiScenario ? 'sel' : ''}`}
-                    onClick={() => setSelectedScenarioId(s.id)}
-                  >
-                    <span>{s.name || s.id}</span>
-                    <span className={verdict === 'breaks' ? 'hit' : verdict === 'survives' ? 'ok' : ''}>{verdict}</span>
-                  </div>
-                );
-              })}
-            </div>
-          </section>
-        </aside>
-
-        {/* CENTRE STAGE */}
-        <section className="card stage" id="arch-stage" aria-labelledby="gh">
-          <div className="stage-head">
-            <h2 id="gh">Architecture</h2>
-            <span className="chip" id="viewChip">{designMode === 'before' ? 'current design' : designMode === 'after' ? 'with fixes' : 'comparison diff'}</span>
-            {isCreatingNew && <span className="status-pill accent">draft: new</span>}
-            <div className="legend">
-              <span><i style={{ background: 'var(--green)' }} />healthy</span>
-              <span><i style={{ background: 'var(--orange)' }} />strained</span>
-              <span><i style={{ background: 'var(--red)' }} />down</span>
-              <span><i style={{ background: 'var(--boot)' }} />restarting</span>
+            <div className="stage-actions">
+              <button type="button" className="ghost" onClick={() => goToStep('design')}><ArrowLeft className="w-3.5 h-3.5" /> Back to design</button>
+              <button type="button" className="run" onClick={() => goToStep('run')} disabled={!selectedScenario}>
+                Continue to run <ArrowRight className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
+        )}
 
-          <div className="graph-wrap">
-            <svg id="graph" viewBox="0 0 1000 560" role="img" aria-label="Architecture Graph">
-              <g className="src">
-                <circle cx={70} cy={280} r={28} fill="none" stroke="var(--ink-3)" strokeDasharray="3 4" />
-                <text x={70} y={284} textAnchor="middle">Users</text>
-                <text x={70} y={325} textAnchor="middle" style={{ fontSize: '11px', fill: 'var(--ink-3)', fontFamily: 'var(--mono)' }}>
-                  {viewResult ? `${viewResult.requests.toLocaleString()} req` : '300 rps'}
-                </text>
-              </g>
+        {/* ============ STEP 3 — RUN ============ */}
+        {step === 'run' && (
+          <div className="stage-content">
+            <div className="stage-intro">
+              <h1>Run the stress test</h1>
+              <p>This simulates the <b>original design</b> against <b>{scenarioName(selectedScenario)}</b>. Fixes are not applied yet.</p>
+            </div>
 
-              {ingressTarget && nodesById[ingressTarget] && (
-                <path d={computeEdgePath('users', ingressTarget)} className="edge flow" />
-              )}
+            {runError && <div className="insight-card error" role="alert">{runError}</div>}
+            {warnings.length > 0 && <div className="insight-card warn">{warnings.map((w, i) => <span key={i}>{cellText(w)}</span>)}</div>}
 
-              {graphEdges.map((e, idx) => {
-                const isBad = viewResult?.node_errors && (viewResult.node_errors[e.to] || viewResult.client_errors[`${e.from}->${e.to}:timeout`]);
-                return (
-                  <path
-                    key={idx}
-                    d={computeEdgePath(e.from, e.to)}
-                    className={`edge ${isBad ? 'bad' : 'flow'} ${e.opt ? 'opt' : ''}`}
-                  />
-                );
-              })}
-
-              {graphNodes.map((n) => {
-                const st = getNodeState(n.id);
-                const isSelected = selectedNodeId === n.id;
-                const haloColor = st.state === 'down' ? 'var(--red)' : st.state === 'warn' ? 'var(--orange)' : st.state === 'boot' ? 'var(--boot)' : 'var(--accent)';
-                return (
-                  <g
-                    key={n.id}
-                    className={`node ${st.state} ${isSelected ? 'sel' : ''}`}
-                    transform={`translate(${n.x - W / 2}, ${n.y - H / 2})`}
-                    onClick={() => setSelectedNodeId(n.id)}
-                  >
-                    <rect className="halo" x={-5} y={-5} width={W + 10} height={H + 10} rx={16} fill="none" stroke={haloColor} strokeWidth={6} />
-                    <rect className="body" width={W} height={H} rx={12} />
-                    <rect x={0} y={10} width={4} height={H - 20} rx={2} fill={st.state === 'ok' ? 'var(--green)' : st.state === 'warn' ? 'var(--orange)' : 'var(--red)'} />
-                    <text x={16} y={24}>{ICONS[n.type] || '◆'} {n.label}</text>
-                    <text x={16} y={42} className="sub">{st.note || `${n.replicas} rep · ${n.concurrency} slots`}</text>
-                    <rect x={16} y={51} width={W - 32} height={4} rx={2} fill="var(--line)" />
-                    <rect
-                      x={16}
-                      y={51}
-                      width={(W - 32) * Math.min(1, Math.max(0.1, st.util))}
-                      height={4}
-                      rx={2}
-                      fill={st.state === 'ok' ? 'var(--accent)' : st.state === 'warn' ? 'var(--orange)' : 'var(--red)'}
-                    />
-                    {Array.from({ length: Math.min(6, n.replicas) }).map((_, i) => (
-                      <circle key={i} cx={W - 14 - i * 10} cy={19} r={3.2} fill={st.state === 'down' ? 'var(--red)' : 'var(--green)'} />
-                    ))}
-                  </g>
-                );
-              })}
-            </svg>
-          </div>
-
-          {viewResult ? (
-            <div className="tl">
-              <div className="tl-head">
-                <button type="button" className="play" onClick={() => setIsPlaying(!isPlaying)} aria-label={isPlaying ? 'Pause' : 'Play'}>
-                  {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+            {!baselineRun ? (
+              <div className="card pre-run-card">
+                <div className="pre-run-row"><span>Design</span><b>{design?.name}</b><small>{design?.nodes?.length} nodes · {design?.edges?.length} edges</small></div>
+                <div className="pre-run-row"><span>Scenario</span><b>{scenarioName(selectedScenario)}</b><small>{(selectedScenario?.scenario?.events ?? []).length} injected failures</small></div>
+                <div className="pre-run-row"><span>Seed</span><b>42</b><small>Deterministic replay</small></div>
+                <button type="button" className="run wide" onClick={runBaseline} disabled={running}>
+                  {running ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                  {running ? 'Simulating failure scenario…' : 'Run stress test'}
                 </button>
-                <div className="clock">t = <b>{fmtTime(simTime)}</b> <span style={{ color: 'var(--ink-3)', fontSize: '11px', marginLeft: '6px' }}>/ {fmtTime(duration)}</span></div>
-                <div className="tl-legend">
-                  <span><i style={{ background: 'var(--red)' }} />{designMode === 'before' ? 'current design' : 'with fixes'}</span>
-                  {baselinePath && <span><i style={{ background: 'var(--ink-3)' }} />baseline</span>}
-                  <span><i style={{ background: 'var(--ink-3)', opacity: 0.5 }} />SLO threshold</span>
+              </div>
+            ) : (
+              <>
+                <div className="version-banner">
+                  <span className="status-pill">original design · no fixes</span>
+                  <span className="micro">This is your design exactly as provided.</span>
+                </div>
+                <Verdict result={baselineRun} label="Result · original design" />
+                <ArchitectureGraph arch={design} result={baselineRun} simTime={simTime}
+                  selectedNodeId={selectedNodeId} onSelectNode={setSelectedNodeId} label="Original design · live failure state" />
+                <Timeline result={baselineRun} simTime={simTime} label="original design"
+                  onScrub={(t) => { setIsPlaying(false); setSimTime(t); }} isPlaying={isPlaying}
+                  onPlay={() => setIsPlaying(!isPlaying)} scenario={selectedScenario} />
+                <FailureStory result={baselineRun} scenario={selectedScenario}
+                  simTime={simTime} onJump={(t) => { setIsPlaying(false); setSimTime(t); }} />
+                <div className="stage-actions">
+                  <button type="button" className="ghost" onClick={() => goToStep('scenarios')}><ArrowLeft className="w-3.5 h-3.5" /> Choose a different test</button>
+                  {baselinePassed === false
+                    ? <button type="button" className="run" onClick={() => goToStep('fixes')}>Review fix proposals <ArrowRight className="w-3.5 h-3.5" /></button>
+                    : <button type="button" className="run" onClick={() => goToStep('report')}>View report <ArrowRight className="w-3.5 h-3.5" /></button>}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ============ STEP 4 — FIXES ============ */}
+        {step === 'fixes' && (
+          <div className="stage-content">
+            <div className="stage-intro">
+              <h1>Approve possible fixes</h1>
+              <p>Every option below was applied and re-simulated against the same scenario and seed. Only measured improvements can be selected.</p>
+            </div>
+            {fixError && <div className="insight-card error" role="alert">{fixError}</div>}
+            {warnings.length > 0 && <div className="insight-card warn">{warnings.map((w, i) => <span key={i}>{cellText(w)}</span>)}</div>}
+
+            <div className="card diagnosis-card">
+              <h2>Why it failed</h2>
+              <p>{baselineRun?.cascade?.[0]?.detail || baselineRun?.cascade?.[0]?.what || 'The selected stress test breached the SLO envelope.'}</p>
+              <div className="micro">{designFindings.length} static weak spots · {baselineRun?.cascade?.length ?? 0} cascade steps</div>
+            </div>
+
+            {fixes.length === 0 && !fixError && <p className="insp-empty">No fix proposals came back for this run.</p>}
+            <div className="fix-grid">
+              {rankFixes(fixes).map((fix, i) => {
+                const id = fixIdOf(fix);
+                const valid = fix.valid !== false;
+                const v: FixVerification | undefined = fix.verification;
+                const verified = v?.verified === true && v.classification !== 'worse';
+                const selectable = valid && verified && !applying;
+                const isSel = selectedFixIds.has(id);
+                const ops: any[] = Array.isArray(fix.patch?.ops) ? fix.patch.ops : [];
+                const d = v?.deltas || {};
+                const pct = (n: number) => `${n >= 0 ? '+' : ''}${(n * 100).toFixed(2)}pp`;
+                return (
+                  <button key={id || i} type="button" disabled={!selectable}
+                    className={`fix-choice ${isSel ? 'sel' : ''} ${selectable ? '' : 'invalid'}`}
+                    onClick={() => toggleFix(id)}>
+                    <div className="fix-choice-top">
+                      <span className={`checkbox ${isSel ? 'on' : ''}`}>{isSel && <Check className="w-3 h-3" />}</span>
+                      <span className="micro">option {String(i + 1).padStart(2, '0')}</span>
+                      {v && <span className={`status-pill ${verified ? 'success' : v.classification === 'worse' ? 'error' : ''}`}>
+                        {verified ? 'verified'
+                          : v.classification === 'worse' ? 'made worse'
+                            : v.classification === 'improved' ? 'improved, but rejected'
+                              : 'no improvement'}
+                      </span>}
+                      {!valid && <span className="status-pill error">invalid</span>}
+                    </div>
+                    <h3>{fix.recommended_pattern || fix.diagnosis || `Fix ${i + 1}`}</h3>
+                    <p>{fix.rationale || fix.diagnosis || 'Gemini recommendation'}</p>
+                    <div className="fix-choice-meta">
+                      <span>root · <b>{fix.root_cause_node || '—'}</b></span>
+                      <span>{ops.length} patch op{ops.length === 1 ? '' : 's'}</span>
+                    </div>
+                    {v && (
+                      <div className="fix-measured">
+                        <span><small>Measured error</small><b className={v.better?.error_rate ? 'good' : 'bad'}>{pct(d.error_rate || 0)}</b></span>
+                        <span><small>Out of SLO</small><b className={v.better?.seconds_out_of_slo ? 'good' : 'bad'}>{Math.round(d.seconds_out_of_slo || 0)}s</b></span>
+                        <span><small>Post-fault</small><b className={v.better?.post_fault_error_rate ? 'good' : 'bad'}>{pct(d.post_fault_error_rate || 0)}</b></span>
+                      </div>
+                    )}
+                    {v?.candidate && (
+                      <div className={`micro post-fix-note ${v.candidate.slo_breached ? 'breach' : 'clear'}`}>
+                        {v.candidate.slo_breached
+                          ? `after fix: still in SLO breach · ${Math.round(v.candidate.seconds_out_of_slo || 0)}s out of SLO`
+                          : 'after fix: inside SLO'}
+                      </div>
+                    )}
+                    {fix.predicted_impact && <div className="micro">predicted · {cellText(fix.predicted_impact)}</div>}
+                    {fix.rejected_because && <div className="error-text">{cellText(fix.rejected_because)}</div>}
+                    {!valid && <div className="error-text">{(fix.validation_errors || []).map(cellText).join(' · ') || 'Patch validation failed'}</div>}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="stage-actions">
+              <button type="button" className="ghost" onClick={() => goToStep('run')}><ArrowLeft className="w-3.5 h-3.5" /> Back to result</button>
+              <div className="action-cluster">
+                <span className="micro">{selectedFixIds.size} selected</span>
+                <button type="button" className="ghost" onClick={() => setSelectedFixIds(new Set(fixes.filter((f) => f.valid !== false).map(fixIdOf)))} disabled={!fixes.length}>Select all</button>
+                <button type="button" className="ghost" onClick={() => { setReportWithoutFixes(true); setStep('report'); }}>Report without fixes</button>
+                <button type="button" className="run" onClick={applyFixes} disabled={!selectedFixes.length || applying}>
+                  {applying ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                  {applying ? 'Applying & re-simulating…' : 'Apply selected & compare'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ============ STEP 5 — REPORT ============ */}
+        {step === 'report' && (
+          <div className="stage-content report-content">
+            {reportHead()}
+            {reportDetail()}
+            <div className="stage-actions no-print">
+              <button type="button" className="ghost" onClick={() => goToStep(baselinePassed === false ? 'fixes' : 'run')}>
+                <ArrowLeft className="w-3.5 h-3.5" /> Back
+              </button>
+              <button type="button" className="run" onClick={() => goToStep('dashboard')}>
+                View executive dashboard <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ============ STEP 6 — DASHBOARD ============ */}
+        {step === 'dashboard' && (
+          <div className="stage-content dashboard-content">
+            <div className="stage-intro">
+              <h1>Pre-mortem dashboard</h1>
+              <p>Everything you need to decide, on one screen. This is the verified outcome for <b>{design?.name}</b>.</p>
+            </div>
+
+            {/* headline: readiness + verdict + scenario */}
+            <div className="dash-hero">
+              <div className="card dash-scores">
+                <h2>Readiness score <span className="chip">0 — 100</span></h2>
+                <div className="gauge-row">
+                  <ScoreGauge score={beforeScore} label="Before fixes" caption="original design" />
+                  <ArrowRight className="w-5 h-5 gauge-arrow" />
+                  <ScoreGauge score={afterScore} label="After fixes" caption={patchedRun ? 'verified re-run' : 'same design'} />
+                </div>
+                {beforeScore !== null && afterScore !== null && afterScore !== beforeScore && (
+                  <div className={`score-delta ${afterScore > beforeScore ? 'up' : 'down'}`}>
+                    <TrendingUp className="w-3.5 h-3.5" />
+                    {afterScore > beforeScore ? '+' : ''}{afterScore - beforeScore} points
+                    {afterScore > beforeScore ? ' of resilience recovered' : ' net change'}
+                  </div>
+                )}
+              </div>
+
+              <div className="card dash-verdict">
+                <h2>Final verdict</h2>
+                <div className="dash-verdict-main">
+                  <span className="dash-verdict-dot" style={{ background: statusColor(finalRun?.status) }} />
+                  <div>
+                    <h3>{verdictText(finalRun)}</h3>
+                    <p>{finalRun?.slo_breached
+                      ? `SLO breached for ${finalRun.breach_seconds ?? 0}s in the final run.`
+                      : 'Stayed inside the target SLO envelope.'}</p>
+                  </div>
+                </div>
+                <div className="dash-verdict-track">
+                  <span className={`status-pill ${patchedPassed === false ? 'error' : patchedPassed === true ? 'success' : ''}`}>
+                    {patchedRun ? (patchedPassed && baselinePassed === false ? 'fixed after re-simulation' : patchedPassed ? 'survived both runs' : 'still failing') : 'no fix needed'}
+                  </span>
+                  <span className="micro">seed 42 · deterministic</span>
                 </div>
               </div>
 
-              <svg
-                id="timeline"
-                viewBox="0 0 1000 120"
-                preserveAspectRatio="none"
-                onPointerDown={(e) => {
-                  setIsDragging(true);
-                  e.currentTarget.setPointerCapture(e.pointerId);
-                  setIsPlaying(false);
-                  updateTimelineScrub(e.clientX, e.currentTarget);
-                }}
-                onPointerMove={(e) => { if (isDragging) updateTimelineScrub(e.clientX, e.currentTarget); }}
-                onPointerUp={() => setIsDragging(false)}
-                onPointerCancel={() => setIsDragging(false)}
-              >
-                {[0, 0.25, 0.5, 0.75, 1].map((v) => {
-                  const y = 100 - v * 80;
-                  return (
-                    <g key={v}>
-                      <line x1={30} x2={990} y1={y} y2={y} stroke="var(--line)" strokeWidth={0.6} />
-                      <text x={2} y={y + 3}>{(errScale * v * 100).toFixed(0)}%</text>
-                    </g>
-                  );
-                })}
+              <div className="card dash-scenario">
+                <h2><Target className="w-3.5 h-3.5" /> Stress test applied</h2>
+                <h3>{scenarioName(selectedScenario)}</h3>
+                <p>{selectedScenario?.hypothesis || selectedScenario?.scenario?.description || 'Adversarial failure hypothesis'}</p>
+                <div className="dash-scenario-stats">
+                  <span><b>{scenarioEvents.length}</b> events injected</span>
+                  <span><b>{selectedScenario?.scenario?.duration_s ?? '—'}s</b> window</span>
+                  <span><b>{scenarioTargets.length}</b> target{scenarioTargets.length === 1 ? '' : 's'}</span>
+                </div>
+                {scenarioTargets.length > 0 && <div className="micro">targets · {scenarioTargets.join(', ')}</div>}
+              </div>
+            </div>
 
-                {[0, 1, 2, 3, 4, 5, 6].map((i) => (
-                  <text key={i} x={xFor((i / 6) * duration) - 8} y={114}>{fmtTime((i / 6) * duration)}</text>
+            {/* KPI cards */}
+            <div className="card">
+              <h2><Activity className="w-3.5 h-3.5" /> Key metrics <span className="chip">before → after</span></h2>
+              <div className="kpi-grid">
+                {[
+                  { label: 'Peak error rate', before: fmtPct(metric(baselineRun, ['error_rate'])), after: fmtPct(metric(finalRun, ['error_rate'])), change: delta(metric(baselineRun, ['error_rate']), metric(finalRun, ['error_rate']), 'pp'), tone: deltaTone(metric(baselineRun, ['error_rate']), metric(finalRun, ['error_rate'])) },
+                  { label: 'p99 latency', before: fmtMs(metric(baselineRun, ['p99_ms'])), after: fmtMs(metric(finalRun, ['p99_ms'])), change: delta(metric(baselineRun, ['p99_ms']), metric(finalRun, ['p99_ms']), 'ms'), tone: deltaTone(metric(baselineRun, ['p99_ms']), metric(finalRun, ['p99_ms'])) },
+                  { label: 'Time out of SLO', before: fmtSecs(metric(baselineRun, ['seconds_out_of_slo', 'breach_seconds'])), after: fmtSecs(metric(finalRun, ['seconds_out_of_slo', 'breach_seconds'])), change: delta(metric(baselineRun, ['seconds_out_of_slo', 'breach_seconds']), metric(finalRun, ['seconds_out_of_slo', 'breach_seconds']), 's'), tone: deltaTone(metric(baselineRun, ['seconds_out_of_slo', 'breach_seconds']), metric(finalRun, ['seconds_out_of_slo', 'breach_seconds'])) },
+                  { label: 'Post-fault error rate', before: fmtPct(metric(baselineRun, ['post_fault_error_rate'])), after: fmtPct(metric(finalRun, ['post_fault_error_rate'])), change: delta(metric(baselineRun, ['post_fault_error_rate']), metric(finalRun, ['post_fault_error_rate']), 'pp'), tone: deltaTone(metric(baselineRun, ['post_fault_error_rate']), metric(finalRun, ['post_fault_error_rate'])) },
+                  { label: 'Recovery', before: fmtSecs(metric(baselineRun, ['recovery_s'])), after: fmtSecs(metric(finalRun, ['recovery_s'])), change: delta(metric(baselineRun, ['recovery_s']), metric(finalRun, ['recovery_s']), 's'), tone: deltaTone(metric(baselineRun, ['recovery_s']), metric(finalRun, ['recovery_s'])) },
+                ].map((k) => (
+                  <div className="kpi-card" key={k.label}>
+                    <span className="micro">{k.label}</span>
+                    <b>{k.after}</b>
+                    <div className="kpi-card-foot"><span>was {k.before}</span><span className={`delta ${k.tone}`}>{k.change}</span></div>
+                  </div>
                 ))}
-
-                {eventMarkers.map((m, i) => {
-                  const color = m.kind === 'load' ? 'var(--accent)' : ['kill', 'restart'].includes(m.kind) ? 'var(--red)' : m.kind === 'restore' ? 'var(--green)' : 'var(--orange)';
-                  return <line key={i} x1={xFor(m.t)} x2={xFor(m.t)} y1={10} y2={100} stroke={color} strokeWidth={1.1} opacity={0.65} />;
-                })}
-
-                {viewResult?.slo_error_rate !== undefined && (
-                  <line x1={30} x2={990} y1={yFor(viewResult.slo_error_rate)} y2={yFor(viewResult.slo_error_rate)} stroke="var(--ink-3)" strokeWidth={1} strokeDasharray="4 4" opacity={0.7} />
-                )}
-
-                {baselinePath && <path d={baselinePath} fill="none" stroke="var(--ink-3)" strokeWidth={1.5} opacity={0.9} />}
-                <path d={timelinePath} fill="none" stroke="var(--red)" strokeWidth={2} />
-                <path d={`${timelinePath} L990 100 L30 100 Z`} fill="var(--red)" opacity={0.12} />
-                {!timeline.length && (
-                  <text x={510} y={55} textAnchor="middle" fill="var(--ink-3)" style={{ fontSize: '12px' }}>Run a scenario to plot the real error-rate curve</text>
-                )}
-
-                <line x1={xFor(simTime)} x2={xFor(simTime)} y1={6} y2={104} stroke="var(--ink)" strokeWidth={1.5} />
-                <circle cx={xFor(simTime)} cy={yFor(scrubErr)} r={4} fill="var(--ink)" />
-              </svg>
-            </div>
-          ) : (
-            <div className="tl tl-empty"><span>Run a scenario to generate the replay timeline.</span></div>
-          )}
-        </section>
-
-        {/* RIGHT RAIL */}
-        <aside className="stack right">
-          <section className="card" aria-labelledby="ih">
-            <h2 id="ih"><span>Node inspector</span>{selectedNode && <span className="chip">{selectedNode.type}</span>}</h2>
-            {selectedNode ? (
-              <div>
-                <div className="insp-title">
-                  <b>{selectedNode.label}</b>
-                  {selectedNodeState && (
-                    <span className="state" style={{
-                      background: selectedNodeState.state === 'ok' ? 'rgba(109,219,160,.15)' : selectedNodeState.state === 'warn' ? 'rgba(242,166,90,.15)' : 'rgba(255,107,125,.15)',
-                      color: selectedNodeState.state === 'ok' ? 'var(--green)' : selectedNodeState.state === 'warn' ? 'var(--orange)' : 'var(--red)',
-                    }}>{selectedNodeState.state}</span>
-                  )}
-                </div>
-                <div className="rows">
-                  <dt>Replicas</dt><dd>{selectedNode.replicas} active</dd>
-                  <dt>Capacity</dt><dd>{selectedNode.replicas * selectedNode.concurrency} concurrent slots</dd>
-                  <dt>Latency (p50 / p99)</dt><dd>{selectedNode.p50 || 15}ms / {selectedNode.p99 || 45}ms</dd>
-                  {selectedNode.requires && <><dt>Startup dependencies</dt><dd>{selectedNode.requires.join(', ')}</dd></>}
-                  {selectedNode.rate_limit && <><dt>Rate limit</dt><dd>{selectedNode.rate_limit} rps</dd></>}
-                </div>
-                <div className="bar">
-                  <i style={{
-                    width: `${Math.min(100, (selectedNodeState?.util || 0.2) * 100)}%`,
-                    background: selectedNodeState?.state === 'ok' ? 'var(--green)' : selectedNodeState?.state === 'warn' ? 'var(--orange)' : 'var(--red)',
-                  }} />
-                </div>
-                <div className="micro" style={{ marginTop: '4px' }}>{selectedNodeState?.note}</div>
               </div>
-            ) : (
-              <p className="insp-empty">Click any node on the graph to inspect queuing and latency.</p>
-            )}
-          </section>
+            </div>
 
-          <section className="card" id="story-sec" aria-labelledby="sth">
-            <h2 id="sth"><span>Failure story</span><span className="chip">{viewResult?.cascade?.length || 0} steps</span></h2>
-            <ol className="story">
-              {viewResult && viewResult.cascade && viewResult.cascade.length > 0 ? (
-                viewResult.cascade.map((c: any, i: number) => {
-                  const isPast = simTime >= c.t;
-                  const dotColor = c.what.includes('kill') || c.what.includes('down') ? 'var(--red)' : c.what.includes('saturated') || c.what.includes('unhealthy') ? 'var(--orange)' : c.what.includes('boot') ? 'var(--boot)' : 'var(--green)';
-                  return (
-                    <li key={i} className={isPast ? 'past' : ''} onClick={() => setSimTime(Math.round(c.t))}>
-                      <div className="b" style={{ borderColor: dotColor }} />
-                      <time>{fmtTime(c.t)}</time>
-                      <div className="txt"><strong>{c.node || c.edge}:</strong> {c.detail || c.what}</div>
-                    </li>
-                  );
-                })
+            {/* risk posture + shape of the system */}
+            <div className="report-two-col">
+              <div className="card">
+                <h2><Gauge className="w-3.5 h-3.5" /> Risk posture <span className="chip">{totalFindings} static weak spots</span></h2>
+                {totalFindings > 0 ? (
+                  <div className="risk-bars">
+                    {severityCounts.map((s) => (
+                      <div className="risk-row" key={s.sev}>
+                        <span className={`status-pill ${s.sev}`}>{s.sev}</span>
+                        <div className="risk-bar"><i style={{ width: `${(s.count / totalFindings) * 100}%` }} /></div>
+                        <b>{s.count}</b>
+                      </div>
+                    ))}
+                  </div>
+                ) : <p className="insp-empty">No static weak spots were detected in this design.</p>}
+              </div>
+              <div className="card">
+                <h2><Layers className="w-3.5 h-3.5" /> System at a glance</h2>
+                <div className="dash-facts">
+                  <div><span>Architecture</span><b>{design?.name || '—'}</b></div>
+                  <div><span>Nodes / edges</span><b>{design?.nodes?.length ?? 0} / {design?.edges?.length ?? 0}</b></div>
+                  <div><span>Source</span><b>{designSource === 'generated' ? 'Gemini-generated' : designSource === 'import' ? 'Imported spec' : 'Reference template'}</b></div>
+                  <div><span>Fixes applied</span><b>{appliedFixIds.length}</b></div>
+                  <div><span>Structural changes</span><b>{diffChanges.length}</b></div>
+                </div>
+              </div>
+            </div>
+
+            {/* fixes + mini evidence */}
+            <div className="card">
+              <h2><Check className="w-3.5 h-3.5" /> Fix summary <span className="chip">{appliedFixIds.length} approved</span></h2>
+              {appliedFixIds.length ? (
+                <div className="fix-summary-grid">
+                  {appliedFixIds.map((id, i) => {
+                    const fix = fixes.find((f) => fixIdOf(f) === id);
+                    return (
+                      <div className="fix-summary" key={i}>
+                        <span className="step-marker done"><Check className="w-3 h-3" /></span>
+                        <div><b>{fix?.recommended_pattern || id}</b><span className="micro">root cause · {fix?.root_cause_node || '—'}</span></div>
+                      </div>
+                    );
+                  })}
+                </div>
               ) : (
-                <>
-                  {(rawScenario?.traffic?.ramp ?? []).map((r: any, i: number) => (
-                    <li key={`story-ramp-${i}`} className={simTime >= r.at_s ? 'past' : ''} onClick={() => setSimTime(r.at_s)}>
-                      <div className="b" style={{ borderColor: 'var(--accent)' }} />
-                      <time>{fmtTime(r.at_s)}</time>
-                      <div className="txt">Traffic ramps to {r.multiplier}× peak.{r.ramp_s ? ` Ramp lasts ${r.ramp_s}s.` : ''}</div>
-                    </li>
-                  ))}
-                  {(rawScenario?.events ?? []).map((e: any, i: number) => (
-                    <li key={`story-event-${i}`} className={simTime >= e.at_s ? 'past' : ''} onClick={() => setSimTime(e.at_s)}>
-                      <div className="b" style={{ borderColor: ['kill', 'restart'].includes(e.action) ? 'var(--red)' : e.action === 'restore' ? 'var(--green)' : 'var(--orange)' }} />
-                      <time>{fmtTime(e.at_s)}</time>
-                      <div className="txt">{describeEvent(e)}</div>
-                    </li>
-                  ))}
-                  {!rawScenario && <li><div className="txt">Loading scenario…</div></li>}
-                  {rawScenario && (rawScenario.events ?? []).length === 0 && (rawScenario.traffic?.ramp ?? []).length === 0 && (
-                    <li className="past"><div className="txt">Nominal steady-state load — no failures injected.</div></li>
-                  )}
-                </>
+                <p className="insp-empty">{reportWithoutFixes ? 'No fixes were applied — this is the original design.' : 'The original design survived, so no fixes were needed.'}</p>
               )}
-            </ol>
-          </section>
+              {patchedRun && (
+                <Timeline result={patchedRun} compareTo={baselineRun} simTime={simTime}
+                  onScrub={(t) => { setIsPlaying(false); setSimTime(t); }} isPlaying={isPlaying}
+                  onPlay={() => setIsPlaying(!isPlaying)} scenario={selectedScenario} />
+              )}
+            </div>
 
-          <section className="card" id="fixes-sec" aria-labelledby="fh">
-            <h2 id="fh"><span>AI remediation</span><span className="chip">{aiFixes.length} proposals</span></h2>
-            <p className="fix-context">{findings.length} static weak spots analyzed · Discrete, atomic patches proposed from the failed run. Select any and re-simulate together.</p>
-
-            {promptError && (
-              <div className="insight-card error" role="alert">
-                <span className="micro">Prompt error</span>
-                <span>{promptError}</span>
-              </div>
-            )}
-
-            {currentPassed === true && (
-              <div className="insight-card success">
-                <ShieldCheck className="w-3.5 h-3.5" />
-                <span><b>Survived</b> — nothing to fix for this scenario.</span>
-              </div>
-            )}
-
-            {remediating && (
-              <div className="thinking">
-                <div className="thinking-step">Correlating cascade events with static findings…</div>
-                <div className="thinking-step">Drafting discrete patch operations…</div>
-                <div className="thinking-step">Validating candidate patches…</div>
-              </div>
-            )}
-
-            {!result && <p className="insp-empty">Run an adversarial scenario to surface fix recommendations.</p>}
-
-            {aiFixes.map((fix, idx) => {
-              const id = fixIdOf(fix);
-              const valid = fix.valid !== false;
-              const severity = String(fix.severity || 'medium').toLowerCase();
-              const opCount = Array.isArray(fix.patch?.ops) ? fix.patch.ops.length : 0;
-              return (
-                <div key={id || idx} className={`fix-card ${selectedFixIds.has(id) ? 'sel' : ''} ${valid ? '' : 'invalid'}`}>
-                  <div className="fix-head">
-                    <label className="fix-label">
-                      <input
-                        type="checkbox"
-                        className="fix-check"
-                        checked={selectedFixIds.has(id)}
-                        disabled={!valid || applyingFixes}
-                        onChange={() => toggleFix(id)}
-                      />
-                      <span className={`status-pill ${severity}`}>{severity}</span>
-                      <b>{fix.recommended_pattern || fix.diagnosis || `Fix ${idx + 1}`}</b>
-                    </label>
-                  </div>
-                  <p className="fix-why">{fix.rationale || fix.diagnosis || 'Gemini recommendation'}</p>
-                  <div className="fix-meta">
-                    <span>root · <b>{fix.root_cause_node || '—'}</b></span>
-                    <span>impact · {cellText(fix.predicted_impact)}</span>
-                    <span>{opCount} patch op{opCount === 1 ? '' : 's'}</span>
-                  </div>
-                  {!valid && (
-                    <div className="micro error-text">
-                      invalid: {(fix.validation_errors || []).map((v: any) => cellText(v)).join(' · ') || 'patch validation failed'}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-
-            <div className="approval-bar">
-              <span className="micro">{selectedFixIds.size} selected</span>
-              <div className="approval-actions">
-                <button type="button" className="ghost" onClick={() => setSelectedFixIds(new Set(aiFixes.filter((f) => f.valid !== false).map(fixIdOf)))} disabled={!aiFixes.length}>Select all</button>
-                <button type="button" className="ghost" onClick={() => setSelectedFixIds(new Set())} disabled={!selectedFixIds.size}>Clear</button>
-                <button type="button" className="run small" onClick={handleSimulateSelectedFixes} disabled={!selectedFixes.length || applyingFixes}>
-                  {applyingFixes ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
-                  {applyingFixes ? 'Applying…' : 'Simulate selected fixes'}
-                </button>
+            <div className="stage-actions no-print">
+              <button type="button" className="ghost" onClick={startOver}><Plus className="w-3.5 h-3.5" /> Start a new pre-mortem</button>
+              <div className="action-cluster">
+                <button type="button" className="ghost" onClick={() => goToStep('report')}><ArrowLeft className="w-3.5 h-3.5" /> Detailed report</button>
+                <button type="button" className="action-btn" onClick={exportYaml}><Download className="w-3.5 h-3.5" /> Export final YAML</button>
+                <button type="button" className="run" onClick={() => window.print()}><FileText className="w-3.5 h-3.5" /> Save dashboard + report as PDF</button>
               </div>
             </div>
 
-            {lastDiff && lastDiff.changes?.length > 0 && (
-              <div className="context-card">
-                <div className="micro">Last patch · {lastDiff.changes.length} change(s)</div>
-                <div className="micro">{lastDiff.fingerprint_before?.slice?.(0, 8) || '—'} → {lastDiff.fingerprint_after?.slice?.(0, 8) || fpShort}</div>
-              </div>
-            )}
-
-            <div className="dashed" />
-            <div className="micro section-label">Static hints (manual)</div>
-            <div id="finds">
-              {recommendations.length === 0 && <p className="insp-empty">No static hints for this architecture.</p>}
-              {recommendations.map((fix) => {
-                const isApplied = appliedFixes.has(fix.id);
-                return (
-                  <div key={fix.id} className="find">
-                    <div className="find-h"><span className={`sev ${fix.severity}`}>{fix.severity}</span><b>{fix.target}</b></div>
-                    <p className="fix-title">{fix.title}</p>
-                    <p className="fix-why">{fix.why}</p>
-                    <div className="fix">
-                      <button type="button" className={`apply ${isApplied ? 'applied' : ''}`} disabled={isApplied || simulating} onClick={() => handleApplyRecommendedFix(fix)}>
-                        {isApplied ? '✓ Applied' : 'Apply & re-simulate'}
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
+            {/* Print-only appendix: the detailed report follows the dashboard. */}
+            <div className="print-report-appendix report-content">
+              {reportHead()}
+              {reportDetail()}
             </div>
-          </section>
-        </aside>
-
-        {/* COMPARE PANEL */}
-        {designMode === 'compare' && (
-          <section className="card compare-panel" id="compare-sec" aria-labelledby="ch">
-            <h2 id="ch"><span>Before / after</span><span className="chip">seed 42 · same scenario</span></h2>
-            <p className="fix-context">
-              {cellText(scenarioLabel(currentScenarioObject) || selectedScenarioId)}
-              {' · '}
-              {baselineModel?.nodes?.length ?? '—'} → {rawModel?.nodes?.length ?? '—'} nodes · {baselineModel?.edges?.length ?? '—'} → {rawModel?.edges?.length ?? '—'} edges
-            </p>
-            <div className="compare-grid">
-              {compareMetrics.map((m) => (
-                <div className="insight-card" key={m.label}>
-                  <span className="micro">{m.label}</span>
-                  <div className="compare-values"><span>{m.before}</span><b>→</b><strong>{m.after}</strong></div>
-                  <span className="delta">{m.delta}</span>
-                </div>
-              ))}
-            </div>
-
-            <div className="micro section-label">Difference report</div>
-            {diffRows.length ? (
-              <table className="diff-table">
-                <thead><tr><th>Change</th><th>Path</th><th>Before</th><th>After</th></tr></thead>
-                <tbody>
-                  {diffRows.map((row, i) => (
-                    <tr key={i}>
-                      <td><span className={`status-pill ${row.kind === 'resolved' ? 'low' : row.kind === 'new' ? 'high' : ''}`}>{row.kind}</span></td>
-                      <td className="mono-cell">{cellText(row.path)}</td>
-                      <td className="mono-cell">{cellText(row.before)}</td>
-                      <td className="mono-cell">{cellText(row.after)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : (
-              <p className="insp-empty">No structural differences reported — behaviour changed through the same topology.</p>
-            )}
-          </section>
+          </div>
         )}
       </main>
 
-      {/* ===== BOTTOM PROMPT DOCK ===== */}
-      <div className="prompt-dock">
-        <div className="dock-side">
-          <span className="context-chip">@architecture</span>
-          <span className="status-pill">{isCreatingNew ? 'draft: new' : (rawModel?.name || 'no model')}</span>
-        </div>
-        <div className="dock-core">
-          {thinkingSteps.length > 0 && (
-            <div className="thinking inline">
-              {thinkingSteps.map((s, i) => <span className="thinking-step" key={i}>{s}</span>)}
-            </div>
-          )}
-          <textarea
-            className="dock-input"
-            value={promptText}
-            onChange={(e) => setPromptText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleApplyPrompt();
-              }
-            }}
-            placeholder={isCreatingNew ? 'Describe a new architecture…' : 'Ask Gemini to change only what you describe…'}
-            rows={1}
-          />
-        </div>
-        <button type="button" className="dock-send" onClick={handleApplyPrompt} disabled={isApplyingPrompt || !promptText.trim()}>
-          {isApplyingPrompt ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Wand2 className="w-3.5 h-3.5" />}
-          <span>{isApplyingPrompt ? 'Working…' : (isCreatingNew ? 'Generate' : 'Apply')}</span>
-        </button>
-      </div>
-
-      {/* ===== SLIDE-OVER DRAWER (Prompt, Spec Editor, Import/Export) ===== */}
-      {isDrawerOpen && (
-        <div className="drawer-backdrop" onClick={() => setIsDrawerOpen(false)}>
+      {/* ---------- Create-by-prompt drawer ---------- */}
+      {drawerOpen && (
+        <div className="drawer-backdrop" onClick={() => setDrawerOpen(false)}>
           <div className="drawer" onClick={(e) => e.stopPropagation()}>
             <div className="drawer-head">
-              <h3>
-                <Sparkles className="w-4 h-4 text-accent" />
-                {isCreatingNew ? 'Describe a new architecture' : 'Architecture modeler'}
-              </h3>
-              <button type="button" className="drawer-close" onClick={() => setIsDrawerOpen(false)}><X className="w-4 h-4" /></button>
+              <h3><Sparkles className="w-4 h-4 text-accent" /> Describe a new architecture</h3>
+              <button type="button" className="drawer-close" onClick={() => setDrawerOpen(false)}><X className="w-4 h-4" /></button>
             </div>
-
-            <div className="drawer-tabs">
-              <button type="button" className={`drawer-tab ${drawerTab === 'prompt' ? 'active' : ''}`} onClick={() => setDrawerTab('prompt')}>AI prompting</button>
-              <button type="button" className={`drawer-tab ${drawerTab === 'editor' ? 'active' : ''}`} onClick={() => setDrawerTab('editor')}>YAML editor</button>
-              <button type="button" className={`drawer-tab ${drawerTab === 'import_export' ? 'active' : ''}`} onClick={() => setDrawerTab('import_export')}>Import / export</button>
-            </div>
-
             <div className="drawer-body">
-              {drawerTab === 'prompt' && (
-                <div>
-                  <label className="field-label">
-                    {isCreatingNew
-                      ? 'Describe a new architecture'
-                      : 'Describe architectural modifications or resilience requirements'}
-                  </label>
-                  <textarea
-                    className="editor-textarea"
-                    style={{ height: '150px' }}
-                    placeholder={isCreatingNew
-                      ? 'Describe a new architecture…'
-                      : 'e.g. Add 2 read replicas to the database with write_ratio 0.2 and enable exponential backoff on payment gateway…'}
-                    value={promptText}
-                    onChange={(e) => setPromptText(e.target.value)}
-                  />
-                  {thinkingSteps.length > 0 && (
-                    <div className="thinking">
-                      {thinkingSteps.map((s, i) => <div className="thinking-step" key={i}>{s}</div>)}
-                    </div>
-                  )}
-                  <div className="dashed" />
-                  <div className="micro section-label">Quick presets</div>
-                  <div className="chip-group">
-                    <button type="button" className="chip-btn" onClick={() => { setIsCreatingNew(false); setPromptText('Add Redis cache with 90% warm hit rate to relieve database'); }}>+ Redis cache</button>
-                    <button type="button" className="chip-btn" onClick={() => { setIsCreatingNew(false); setPromptText('Scale database with 2 read replicas and read fallback'); }}>+ Read replicas</button>
-                    <button type="button" className="chip-btn" onClick={() => { setIsCreatingNew(false); setPromptText('Enable exponential backoff with jitter on all downstream retries'); }}>+ Backoff &amp; jitter</button>
-                    <button type="button" className="chip-btn" onClick={() => { setIsCreatingNew(false); setPromptText('Break circular startup boot dependencies'); }}>+ Break boot deadlock</button>
-                  </div>
-                  {promptError && <div className="insight-card error" role="alert"><span className="micro">Error</span><span>{promptError}</span></div>}
-                </div>
-              )}
-
-              {drawerTab === 'editor' && (
-                <div>
-                  <label className="field-label">Live architecture YAML specification</label>
-                  <textarea className="editor-textarea" value={rawYaml} onChange={(e) => setRawYaml(e.target.value)} />
-                </div>
-              )}
-
-              {drawerTab === 'import_export' && (
-                <div>
-                  <h4 className="drawer-subtitle">Import architecture spec</h4>
-                  <p className="fix-context">Upload any custom YAML or JSON architecture file to simulate and stress-test.</p>
-                  <button type="button" className="action-btn" onClick={() => fileInputRef.current?.click()} style={{ marginBottom: '16px' }}>
-                    <Upload className="w-4 h-4" /><span>Choose file (.yaml / .json)</span>
-                  </button>
-                  {importStatus && <div className="insight-card"><span>{importStatus}</span></div>}
-                  <div className="dashed" />
-                  <h4 className="drawer-subtitle">Export architecture spec</h4>
-                  <p className="fix-context">Download the current architecture definition.</p>
-                  <button type="button" className="action-btn" onClick={handleExportYaml}>
-                    <Download className="w-4 h-4" /><span>Download {rawModel?.name || selectedModelId || 'architecture'}.yaml</span>
-                  </button>
-                </div>
-              )}
+              <label className="field-label">Plain-language architecture brief</label>
+              <textarea className="editor-textarea" style={{ height: 260 }}
+                placeholder={'e.g. A 3-tier web app: ingress load balancer → API service (4 replicas) → Redis cache and Postgres database, with an external email API.'}
+                value={promptText} onChange={(e) => setPromptText(e.target.value)} />
+              {thinkingSteps.length > 0 && <div className="thinking">{thinkingSteps.map((s, i) => <div className="thinking-step" key={i}>{s}</div>)}</div>}
+              {promptError && <div className="insight-card error" role="alert">{promptError}</div>}
+              <div className="dashed" />
+              <div className="micro section-label">Tips for a good brief</div>
+              <ul className="tip-list">
+                <li>Name each hop and its direction (gateway → service → database).</li>
+                <li>Include replica counts, concurrency, timeouts and retry behaviour.</li>
+                <li>Mention caches, external dependencies and startup dependencies.</li>
+              </ul>
             </div>
-
             <div className="drawer-footer">
-              <button type="button" className="action-btn" onClick={() => setIsDrawerOpen(false)}>Cancel</button>
-              {drawerTab === 'prompt' && (
-                <button type="button" className="run" onClick={handleApplyPrompt} disabled={isApplyingPrompt || !promptText.trim()}>
-                  {isApplyingPrompt ? <><RefreshCw className="w-4 h-4 animate-spin" /><span>Working…</span></> : <span>{isCreatingNew ? 'Generate with Gemini' : 'Apply with Gemini'}</span>}
-                </button>
-              )}
-              {drawerTab === 'editor' && <button type="button" className="run" onClick={handleApplySpec}>Validate &amp; apply spec</button>}
+              <button type="button" className="action-btn" onClick={() => setDrawerOpen(false)}>Cancel</button>
+              <button type="button" className="run" onClick={createFromPrompt} disabled={generatingDesign || !promptText.trim()}>
+                {generatingDesign ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                {generatingDesign ? 'Generating…' : 'Generate with Gemini'}
+              </button>
             </div>
           </div>
         </div>
       )}
 
-      {simulating && (
+      {(running || applying) && (
         <div className="sim-overlay" role="status" aria-live="polite">
           <div className="sim-card">
             <div className="sim-spinner" />
-            <strong>{remediating ? 'Gemini is proposing fixes…' : 'Simulating failure scenario…'}</strong>
-            <span>{scenarioLabel(currentScenarioObject) || selectedScenarioId} · {rawModel?.name || selectedModelId}</span>
+            <strong>{applying ? 'Applying fixes and re-simulating…' : remediating ? 'Gemini is proposing fixes…' : 'Simulating failure scenario…'}</strong>
+            <span>{scenarioName(selectedScenario)} · {design?.name}</span>
           </div>
         </div>
       )}

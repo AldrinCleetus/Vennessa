@@ -66,7 +66,24 @@ export interface SimulationResult {
   slo_recover_within_s?: number;
   slo_window_s?: number;
   architecture_fingerprint?: string;
+  survived?: boolean;
+  recovered?: boolean;
+  fault_error_rate?: number;
+  post_fault_error_rate?: number;
+  seconds_out_of_slo?: number;
 }
+
+export type FixVerification = {
+  verified: boolean;
+  classification: 'improved' | 'worse' | 'neutral';
+  scope?: 'single' | 'combination';
+  verdict_improved?: boolean;
+  post_fault_regression?: boolean;
+  deltas?: Record<string, number>;
+  better?: Record<string, boolean>;
+  original?: Partial<SimulationResult>;
+  candidate?: Partial<SimulationResult>;
+};
 
 export interface ModelSummary {
   id: string;

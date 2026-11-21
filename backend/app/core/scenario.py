@@ -94,6 +94,14 @@ class Scenario(Strict):
         ends += [r.at_s + r.ramp_s for r in self.traffic.ramp]
         return max(ends, default=self.warmup_s)
 
+    @property
+    def fault_windows(self) -> list[tuple[float, float]]:
+        """Injected-fault intervals used for windowed scoring and honest verdicts."""
+        return [
+            (float(e.at_s), float(e.at_s) + float(e.duration_s or 30.0))
+            for e in self.events
+        ]
+
 
 def load_scenario(path: str | Path) -> Scenario:
     path = Path(path)

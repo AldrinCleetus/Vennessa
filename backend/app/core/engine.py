@@ -127,6 +127,14 @@ class Simulation:
         self.edge_pools: dict[tuple[str, str], Pool] = {
             e.key: Pool(self.env, e.pool, None) for e in arch.edges if e.pool
         }
+        # Additive per-edge control state: circuit breaker + retry budget.
+        self.edge_state: dict[tuple[str, str], dict[str, float]] = {
+            e.key: {
+                "cb_calls": 0, "cb_failed": 0, "open_until": 0.0,
+                "win_at": 0.0, "calls": 0, "retries": 0,
+            }
+            for e in arch.edges
+        }
         self.st: dict[str, NodeState] = {}
         for n in arch.nodes:
             self.st[n.id] = NodeState(
@@ -170,6 +178,7 @@ class Simulation:
             window_s=slo.window_s,
             replicas={n.id: n.replicas for n in self.arch.nodes},
             skipped_targets=self.skipped,
+            fault_windows=self.sc.fault_windows,
         )
         s.wall_time_s = wall
         s.sim_events = self.requests_handled
@@ -204,9 +213,9 @@ class Simulation:
 
     # ------------------------------------------------------------------ request handling
 
-    def _handle(self, node_id: str, src: str, key: float):
+    def _handle(self, node_id: str, src: str, key: float, deadline: float | None = None):
         """Process a request (from traffic source `src`, for shard key `key`) at a node.
-        Returns (ok, reason)."""
+        Returns (ok, reason). `deadline` is the caller's remaining budget."""
         self.requests_handled += 1
         ns = self.st[node_id]
         n = ns.node
@@ -238,6 +247,9 @@ class Simulation:
         granted = yield slot
         if not granted:
             return done(False, f"{node_id}:dropped", own=True)
+        if deadline is not None and self.env.now > deadline:
+            # Deadline propagation: do not serve work whose caller has left.
+            return done(False, f"{node_id}:deadline_expired", own=True)
 
         released = False
         try:
@@ -247,9 +259,9 @@ class Simulation:
                 released = True
 
             if n.type == "load_balancer":
-                ok, reason = yield from self._route(node_id, src, key)
+                ok, reason = yield from self._route(node_id, src, key, deadline)
             elif n.type == "shard_router":
-                ok, reason = yield from self._shard(node_id, src, key)
+                ok, reason = yield from self._shard(node_id, src, key, deadline)
             else:
                 ok, reason = True, ""
                 for e in self.out[node_id]:
@@ -257,7 +269,7 @@ class Simulation:
                         continue
                     if e.p < 1.0 and self.rng.random() >= e.p:
                         continue
-                    call_ok, call_reason = yield from self._call(e, src, key)
+                    call_ok, call_reason = yield from self._call(e, src, key, deadline)
                     if not call_ok and e.required:
                         ok, reason = False, call_reason
                         break
@@ -266,16 +278,16 @@ class Simulation:
                 ns.pool.release()
         return done(ok, reason)
 
-    def _route(self, lb_id: str, src: str, key: float):
+    def _route(self, lb_id: str, src: str, key: float, deadline: float | None = None):
         routes = [e for e in self.out[lb_id] if e.sources is None or src in e.sources]
         backends = [e for e in routes if self.st[e.to].up > 0]
         if not backends:
             yield self.env.timeout(FAST_FAIL_S)
             return False, f"{lb_id}:no_healthy_backend"
         e = self.rng.choices(backends, weights=[b.weight for b in backends])[0]
-        return (yield from self._call(e, src, key))
+        return (yield from self._call(e, src, key, deadline))
 
-    def _shard(self, router_id: str, src: str, key: float):
+    def _shard(self, router_id: str, src: str, key: float, deadline: float | None = None):
         """Send the request to the shard owning `key`. Edge weights are each shard's share
         of the key space. Unlike a load balancer, a down shard is not skipped."""
         routes = [e for e in self.out[router_id] if e.sources is None or src in e.sources]
@@ -290,7 +302,7 @@ class Simulation:
             if key < acc:
                 chosen = e
                 break
-        return (yield from self._call(chosen, src, key))
+        return (yield from self._call(chosen, src, key, deadline))
 
     def _read_target(self, e: Edge) -> str | None:
         """Where a read on edge `e` goes: a healthy replica of `e.to`, else the primary
@@ -301,12 +313,27 @@ class Simulation:
             return self.rng.choice(healthy)
         return e.to if primary.read_fallback else None
 
-    def _call(self, e: Edge, src: str, key: float):
-        """Call along an edge with cache lookup, pool, timeout and retries."""
+    def _call(self, e: Edge, src: str, key: float, parent_deadline: float | None = None):
+        """Call along an edge with cache lookup, pool, timeout and retries.
+
+        Supports additive controls: a circuit breaker, a retry budget, an
+        explicit pool acquire timeout and deadline propagation from callers.
+        """
+        es = self.edge_state[e.key]
         if e.via_cache:
-            hit = yield from self._cache_lookup(e, src, key)
+            hit = yield from self._cache_lookup(e, src, key, parent_deadline)
             if hit:
                 return True, ""
+
+        # rolling-second counters for the retry budget
+        now = self.env.now
+        if now - es["win_at"] >= 1.0:
+            es.update(win_at=now, calls=0, retries=0)
+        es["calls"] += 1
+
+        cb = e.circuit_breaker
+        if cb is not None and now < es["open_until"]:
+            return False, f"{e.from_}->{e.to}:circuit_open"
 
         # read/write split: decided once per call, the replica is re-picked on each retry
         splits = e.write_ratio is not None and bool(self.st[e.to].node.read_replicas)
@@ -315,13 +342,25 @@ class Simulation:
         last = f"{e.to}:error"
         for attempt in range(e.retry.attempts + 1):
             if attempt:
+                if e.retry.budget_ratio is not None:
+                    es["retries"] += 1
+                    allowed = es["calls"] * e.retry.budget_ratio
+                    if es["retries"] > allowed:
+                        last = f"{e.from_}->{e.to}:retry_budget_exhausted"
+                        break
                 yield self.env.timeout(self._backoff(e, attempt))
 
             pool = self.edge_pools.get(e.key)
             deadline = self.env.now + e.timeout_ms / 1000
+            if parent_deadline is not None:
+                deadline = min(deadline, parent_deadline)
+            if deadline <= self.env.now:
+                last = f"{e.from_}->{e.to}:deadline_expired"
+                break
+            budget = e.pool_timeout_ms / 1000 if e.pool_timeout_ms is not None else e.timeout_ms / 1000
             if pool is not None:
                 slot = pool.acquire()
-                res = yield slot | self.env.timeout(e.timeout_ms / 1000)
+                res = yield slot | self.env.timeout(min(budget, max(0.0, deadline - self.env.now)))
                 if slot not in res:
                     # gave up waiting for a connection; release it if it arrives later
                     slot.callbacks.append(lambda ev, p=pool: p.release() if ev.value else None)
@@ -335,7 +374,8 @@ class Simulation:
                 yield self.env.timeout(FAST_FAIL_S)
                 last = f"{e.to}:no_read_replica"
                 continue
-            proc = self.env.process(self._handle(target, src, key))
+            child_deadline = deadline if e.deadline_propagation else None
+            proc = self.env.process(self._handle(target, src, key, child_deadline))
             remaining = max(0.0, deadline - self.env.now)
             res = yield proc | self.env.timeout(remaining)
             if pool is not None:
@@ -347,15 +387,25 @@ class Simulation:
             if proc in res:
                 ok, reason = proc.value
                 if ok:
+                    if cb is not None:
+                        es["cb_calls"] += 1
+                        es["cb_failed"] *= 0.9  # slow decay of historical failures
                     return True, ""
                 last = reason
             else:
                 last = f"{e.from_}->{e.to}:timeout"
+            if cb is not None:
+                es["cb_calls"] += 1
+                es["cb_failed"] += 1
+                if es["cb_calls"] >= cb.min_calls and es["cb_failed"] / es["cb_calls"] >= cb.failure_threshold:
+                    es["open_until"] = self.env.now + cb.open_s
+                    es["cb_calls"] = es["cb_failed"] = 0
+                    return False, f"{e.from_}->{e.to}:circuit_open"
         return False, last
 
-    def _cache_lookup(self, e: Edge, src: str, key: float):
+    def _cache_lookup(self, e: Edge, src: str, key: float, deadline: float | None = None):
         cache = self.st[e.via_cache]
-        proc = self.env.process(self._handle(e.via_cache, src, key))
+        proc = self.env.process(self._handle(e.via_cache, src, key, deadline))
         res = yield proc | self.env.timeout(e.cache_timeout_ms / 1000)
         if proc not in res or not proc.value[0]:
             return False  # cache unavailable or slow: treat as a miss

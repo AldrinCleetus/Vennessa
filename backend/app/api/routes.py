@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -22,6 +24,7 @@ from app.core.patch import (
     diff_architectures,
 )
 from app.core.scenario import Scenario, load_scenario
+from app.core.verification import failure_report, verify_fixes, verification_reason
 from app.ai.parser import generate_architecture, text_to_architecture_yaml
 from app.ai.adversary import generate_adversary_scenarios
 from app.ai.remediator import generate_remediation_fixes, remediate_architecture
@@ -62,6 +65,9 @@ class RemediateRequest(BaseModel):
     findings: List[Dict[str, Any]] = Field(default_factory=list)
     count: int = 3
     architecture_fingerprint: Optional[str] = None
+    # Additive: required to verify fixes by re-simulating the same stress test.
+    scenario: Optional[Dict[str, Any]] = None
+    rounds: int = 3
 
 
 class PatchRequest(BaseModel):
@@ -276,7 +282,14 @@ def run_simulation(req: SimulateRequest):
             "node_errors": {n.id: n.errors for n in summary.nodes if n.errors},
             "nodes": [asdict(n) for n in summary.nodes],
             "cascade": summary.cascade,
-            "slo_breached": not summary.passed,
+            # Real SLO semantics: survival and recovery are distinct, and a
+            # breach is never hidden behind a status-based `passed` flag.
+            "slo_breached": summary.slo_breached,
+            "survived": summary.survived,
+            "recovered": summary.recovered,
+            "fault_error_rate": summary.fault_error_rate,
+            "post_fault_error_rate": summary.post_fault_error_rate,
+            "seconds_out_of_slo": summary.seconds_out_of_slo,
             "duration_s": sc.duration_s,
             "warmup_s": sc.warmup_s,
             "slo_error_rate": slo.error_rate_max,
@@ -362,6 +375,7 @@ async def generate_adversary(req: AdversaryRequest):
             "count": len(entries),
             "scenarios": entries,
             "warnings": warnings,
+            "scenario_source": first.get("source") if first else "fallback",
             # Backward compatibility: the first scenario is also exposed flat.
             "scenario": first["scenario"] if first else None,
             "yaml": first["yaml"] if first else "",
@@ -380,19 +394,62 @@ async def remediate(req: RemediateRequest):
     try:
         arch = _resolve_architecture(req.architecture)
         fingerprint = req.architecture_fingerprint or architecture_fingerprint(arch)
-        fixes = await generate_remediation_fixes(
-            arch,
-            req.simulation_result,
-            findings=req.findings,
-            count=req.count,
-            base_fingerprint=fingerprint,
-        )
+        scenario = _resolve_scenario(req.scenario) if req.scenario else None
+
+        fixes: List[Dict[str, Any]] = []
+        verification: Dict[str, Any] = {"status": "no_verified_fix", "results": []}
+        rejection = None
+        rounds = max(1, min(int(req.rounds or 3), 3))
+        deadline = time.monotonic() + 50.0  # keep the whole pipeline under ~60s
+        round_index = 0
+        for round_index in range(rounds):
+            if round_index and time.monotonic() > deadline:
+                break
+            fixes = await generate_remediation_fixes(
+                arch,
+                req.simulation_result,
+                findings=req.findings,
+                count=req.count,
+                base_fingerprint=fingerprint,
+                rejection_reason=rejection,
+                # Coverage retry only on the first round to stay inside 60s.
+                prompt_attempts=2 if round_index == 0 else 1,
+            )
+            if scenario is None:
+                verification = {
+                    "status": "unverified",
+                    "reason": "No scenario was supplied with the remediation request.",
+                    "results": [],
+                }
+                break
+            verification = await asyncio.to_thread(
+                verify_fixes,
+                arch,
+                scenario,
+                fixes,
+                req.simulation_result,
+                scenario.seed,
+                True,  # process pool: one process per simulated candidate
+            )
+            if verification.get("status") == "verified":
+                break
+            if fixes and all(f.get("source") == "fallback" for f in fixes):
+                # Deterministic fallback does not react to rejection reasons.
+                break
+            if time.monotonic() > deadline:
+                break
+            evidence = failure_report(req.simulation_result, verification, arch, fixes)
+            rejection = verification_reason(verification, evidence)
+
         first = fixes[0] if fixes else None
         return {
             "success": True,
             "count": len(fixes),
             "base_fingerprint": fingerprint,
             "fixes": fixes,
+            "status": verification.get("status", "unverified"),
+            "verification": verification,
+            "rounds_used": round_index + 1 if fixes else 0,
             # Backward compatibility with the single-fix response.
             "diagnosis": first["diagnosis"] if first else "",
             "root_cause_node": first["root_cause_node"] if first else "",

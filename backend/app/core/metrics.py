@@ -166,6 +166,14 @@ class RunSummary:
     skipped_targets: list[str]
     wall_time_s: float = 0.0
     sim_events: int = 0
+    # Honest verdict fields. `passed` means "never breached the SLO" (survived);
+    # recovery is tracked separately and never used to claim survival.
+    slo_breached: bool = False
+    survived: bool = True
+    recovered: bool = True
+    fault_error_rate: float = 0.0
+    post_fault_error_rate: float = 0.0
+    seconds_out_of_slo: int = 0
 
     def headline(self) -> str:
         bits = [f"{self.status.upper()}", f"err {self.error_rate:.2%}", f"p99 {self.p99_ms:.0f}ms"]
@@ -190,6 +198,7 @@ def summarize(
     window_s: int,
     replicas: dict[str, int],
     skipped_targets: list[str],
+    fault_windows: list[tuple[float, float]] | None = None,
 ) -> RunSummary:
     start = int(measure_from)
     end = int(duration_s) - 2  # last second the ticker closed
@@ -232,6 +241,34 @@ def summarize(
         recovery = max(0.0, breaches[-1] + 1 - last_event_s)
         status = "degraded" if recovery <= recover_within_s else "slow_recovery"
 
+    # Windowed error rates and honest survival/recovery semantics. The old code
+    # equated `passed` with a status of ok/degraded, so a 3.7x SLO breach could be
+    # reported as a survival. We now classify each window explicitly.
+    windows = sorted((float(a), float(b)) for a, b in (fault_windows or []))
+
+    def _window_rate(lo: float, hi: float) -> float:
+        tot = err = 0
+        for t in range(max(start, int(lo)), min(end, int(hi)) + 1):
+            s = per_t.get(t)
+            if s is not None:
+                tot += s.rps
+                err += round(s.rps * s.err_rate)
+        return err / tot if tot else 0.0
+
+    if windows:
+        fault_error_rate = _window_rate(windows[0][0], windows[-1][1])
+        post_from = max(windows[-1][1], last_event_s)
+        post_fault_error_rate = _window_rate(post_from, end + 1)
+    else:
+        fault_error_rate = errors / total if total else 0.0
+        post_fault_error_rate = 0.0
+
+    # "Survived" means the SLO was never breached in the measured window.
+    # A design that breaks and comes back is `recovered`, never `survived`.
+    slo_breached = bool(breaches)
+    survived = not slo_breached
+    recovered = (not slo_breached) or status in {"ok", "degraded"}
+
     cascade, seen_nodes = [], set()
     for t, node_id, kind, detail in sorted(col.log):
         if kind in {"unhealthy", "down", "boot_blocked", "saturated"} and (node_id, kind) not in seen_nodes:
@@ -262,7 +299,7 @@ def summarize(
         architecture=architecture,
         scenario=scenario,
         status=status,
-        passed=status in {"ok", "degraded"},
+        passed=survived,
         requests=total,
         error_rate=errors / total if total else 0.0,
         p50_ms=hist_quantile(overall_hist, 0.50),
@@ -275,4 +312,10 @@ def summarize(
         cascade=cascade,
         nodes=nodes,
         skipped_targets=skipped_targets,
+        slo_breached=slo_breached,
+        survived=survived,
+        recovered=recovered,
+        fault_error_rate=fault_error_rate,
+        post_fault_error_rate=post_fault_error_rate,
+        seconds_out_of_slo=len(breaches),
     )

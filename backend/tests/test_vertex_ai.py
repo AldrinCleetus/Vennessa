@@ -284,7 +284,14 @@ def test_generate_multiple_fixes_with_discrete_patches():
         ))
 
     assert len(fixes) == 2
-    assert all(f["valid"] for f in fixes), [f["validation_errors"] for f in fixes]
+    # Validation is delta-aware: a fix that IMPROVES capacity but remains
+    # under-sized stays valid, with a machine-readable advisory. The simulator
+    # (not the heuristic) decides whether it is actually worth presenting.
+    assert all(f["valid"] for f in fixes)
+    assert any(
+        any(a.startswith("middle_tier_undersized") for a in f.get("advisories", []))
+        for f in fixes
+    )
     assert fixes[0]["patched_architecture"]["nodes"][1]["replicas"] == 6
     assert fixes[1]["rationale"] == "Spread retries out."
     assert fixes[1]["patch"]["source_fix_id"] == fixes[1]["fix_id"]

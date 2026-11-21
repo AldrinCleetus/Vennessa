@@ -78,8 +78,16 @@ __EXCLUDE_IDS__
 ### REQUESTED SEED (use for every scenario unless a different seed is useful):
 __SEED__
 
-### STATIC FINDINGS FROM ANALYSIS:
+### STATIC FINDINGS FROM ANALYSIS (these drive the scenarios):
 __STATIC_FINDINGS__
+
+Derive attacks from the findings, not from templates. In particular:
+- retry_amplification / retry_no_backoff -> a latency spike ("slow") on the
+  dependency where retries LAND, at 3-5x for 60-120s, to trigger a retry storm.
+- timeout_inversion -> a latency spike on the downstream node that makes the
+  caller's budget expire while the callee keeps working.
+- spof / over_capacity / low_headroom -> loss of the single replica.
+- rate_limit findings -> a rate_limit event at or above the configured limit.
 
 ### OUTPUT FORMAT
 Return ONLY a JSON array with __COUNT__ entries. Each entry has this shape:
@@ -148,27 +156,50 @@ def _fallback_scenarios(arch: Architecture, count: int, seed: int) -> list[dict[
     ids = [n.id for n in arch.nodes]
     if not ids:
         return []
-    risky = [f.target for f in analyze(arch) if f.rule in {"spof", "over_capacity", "low_headroom"}]
+    findings = analyze(arch)
+    risky = [f.target for f in findings if f.rule in {"spof", "over_capacity", "low_headroom"}]
     targets = list(dict.fromkeys(risky + ids))
+    latency_targets = [
+        f.target for f in findings
+        if f.rule in {"retry_amplification", "retry_no_backoff", "timeout_inversion"}
+        and arch.has_node(str(f.target))
+    ]
     scenarios: list[dict[str, Any]] = []
     for i in range(min(count, len(targets))):
         target = targets[i]
-        sc = Scenario.model_validate({
-            "name": f"ai_fallback_{i + 1}",
-            "description": f"Inject a failure into {target} to observe cascading impact.",
-            "duration_s": 300.0,
-            "warmup_s": 30.0,
-            "seed": seed,
-            "events": [{"at_s": 90 + i * 10, "action": "restart", "target": target}],
-        })
+        slow = target in latency_targets or (i == 0 and bool(latency_targets))
+        if slow and latency_targets:
+            target = latency_targets[0] if i == 0 else target
+            sc = Scenario.model_validate({
+                "name": f"ai_fallback_{i + 1}",
+                "description": f"Latency spike on {target} to expose retry amplification and timeout inversion.",
+                "duration_s": 300.0,
+                "warmup_s": 30.0,
+                "seed": seed,
+                "events": [{"at_s": 90 + i * 10, "action": "slow", "target": target,
+                            "factor": 5.0, "duration_s": 90.0}],
+            })
+            hypothesis = (f"Dependency latency at {target} amplifies nested retries and exhausts "
+                          "upstream queues; a correct retry/timeout fix should stop the cascade.")
+        else:
+            sc = Scenario.model_validate({
+                "name": f"ai_fallback_{i + 1}",
+                "description": f"Inject a failure into {target} to observe cascading impact.",
+                "duration_s": 300.0,
+                "warmup_s": 30.0,
+                "seed": seed,
+                "events": [{"at_s": 90 + i * 10, "action": "restart", "target": target}],
+            })
+            hypothesis = f"Restarting {target} exposes startup and failover weaknesses."
         scenarios.append({
             "scenario_id": f"ai_{i + 1}_fallback",
             "scenario": sc.model_dump(),
             "yaml": yaml.dump(sc.model_dump(), sort_keys=False),
-            "hypothesis": f"Restarting {target} exposes startup and failover weaknesses.",
+            "hypothesis": hypothesis,
             "rationale": "Generated from static analysis because Gemini returned no usable scenarios.",
             "target_nodes": [target],
             "seed": seed,
+            "source": "fallback",
         })
     return scenarios
 
@@ -211,7 +242,9 @@ async def generate_adversary_scenarios(
     )
 
     try:
-        payload = _parse_structured(await ai_client.generate_content(prompt))
+        payload = _parse_structured(await ai_client.generate_content(
+            prompt, temperature=0.3, json_mode=True
+        ))
     except Exception as exc:  # malformed output should not break the whole UI
         warnings.append(f"Gemini scenario generation failed ({type(exc).__name__}); using deterministic fallback.")
         payload = None
@@ -271,13 +304,22 @@ async def generate_adversary_scenarios(
             "rationale": rationale,
             "target_nodes": targets,
             "seed": scenario.seed,
+            "source": "gemini",
         })
         if len(entries) >= count:
             break
 
     if not entries:
         entries = _fallback_scenarios(arch, count, seed if seed is not None else 42)
-        warnings.append("No Gemini scenarios were valid; generated deterministic fallback scenarios.")
+        warnings.append(
+            "No Gemini scenarios were valid; generated deterministic fallback scenarios "
+            "derived from static analysis (scenario_source: fallback)."
+        )
+    elif isinstance(payload, list) and len(entries) < len(payload):
+        warnings.append(
+            f"Gemini returned {len(payload)} scenarios but only {len(entries)} were valid; "
+            "the rest were dropped (scenario_source: gemini)."
+        )
     return entries, warnings
 
 

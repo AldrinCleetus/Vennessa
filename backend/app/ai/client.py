@@ -11,13 +11,15 @@ Add to backend/.env:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types as genai_types
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +38,9 @@ DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 API_MODEL = os.getenv("GEMINI_API_MODEL", DEFAULT_MODEL)
-PREFER_API_KEY = os.getenv("GEMINI_PREFER_API_KEY", "").lower() in {"1", "true", "yes"}
+# Prefer the Gemini API key by default. Vertex AI is only attempted when no
+# API key is configured (e.g. on GCP, where ADC is available automatically).
+PREFER_API_KEY = os.getenv("GEMINI_PREFER_API_KEY", "true").lower() in {"1", "true", "yes"}
 
 
 def get_vertex_client() -> genai.Client:
@@ -65,9 +69,18 @@ def get_api_key_model_name() -> str:
     return os.getenv("GEMINI_API_MODEL", API_MODEL)
 
 
-async def generate_content(prompt: str) -> str:
+PROVIDER_TIMEOUT_S = 25.0
+
+
+async def generate_content(
+    prompt: str,
+    temperature: float | None = None,
+    json_mode: bool = False,
+) -> str:
     """Generate text with Vertex AI, falling back to a Gemini API key.
 
+    ``temperature`` (0.2-0.3 for structured fix proposals) and ``json_mode``
+    constrain generation for callers that need stable, machine-readable output.
     The fallback triggers for any provider error (missing ADC, permission
     denied, quota exhausted, unknown model, etc.). Validation of the returned
     YAML/JSON happens in the calling module and is not retried here.
@@ -75,13 +88,20 @@ async def generate_content(prompt: str) -> str:
     Raises:
         RuntimeError: if no provider is configured, or every provider fails.
     """
+    config = None
+    if temperature is not None or json_mode:
+        config = genai_types.GenerateContentConfig(
+            **({"temperature": temperature} if temperature is not None else {}),
+            **({"response_mime_type": "application/json"} if json_mode else {}),
+        )
     attempts: list[tuple[str, Callable[[], genai.Client], Callable[[], str]]] = []
 
-    if PREFER_API_KEY:
-        if API_KEY:
-            attempts.append(("Gemini API key", get_api_key_client, get_api_key_model_name))
-        attempts.append(("Vertex AI", get_vertex_client, get_model_name))
+    if PREFER_API_KEY and API_KEY:
+        # Gemini-only path: do not waste a provider attempt on Vertex when the
+        # user has explicitly opted into the API key (local dev by default).
+        attempts.append(("Gemini API key", get_api_key_client, get_api_key_model_name))
     else:
+        # No API key (or Vertex preferred): Vertex first, API key as fallback.
         attempts.append(("Vertex AI", get_vertex_client, get_model_name))
         if API_KEY:
             attempts.append(("Gemini API key", get_api_key_client, get_api_key_model_name))
@@ -96,9 +116,12 @@ async def generate_content(prompt: str) -> str:
     for provider_name, client_factory, model_name_fn in attempts:
         try:
             client = client_factory()
-            response = await client.aio.models.generate_content(
-                model=model_name_fn(),
-                contents=prompt,
+            kwargs: dict[str, Any] = {"model": model_name_fn(), "contents": prompt}
+            if config is not None:
+                kwargs["config"] = config
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(**kwargs),
+                timeout=PROVIDER_TIMEOUT_S,
             )
             text = getattr(response, "text", None)
             if not text:
