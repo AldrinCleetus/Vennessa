@@ -57,6 +57,15 @@ export interface SimulationResult {
   timeline: TimelinePoint[];
   affected_nodes?: string[];
   cascade_depth?: number;
+  passed?: boolean;
+  first_breach_s?: number | null;
+  last_breach_s?: number | null;
+  skipped_targets?: string[];
+  sim_events?: any[];
+  slo_p99_ms?: number;
+  slo_recover_within_s?: number;
+  slo_window_s?: number;
+  architecture_fingerprint?: string;
 }
 
 export interface ModelSummary {

@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import * as yaml from 'js-yaml';
-import { Play, Pause, RefreshCw, Download, Upload, Sparkles, X } from 'lucide-react';
+import {
+  Play, Pause, RefreshCw, Download, Upload, Sparkles, X, Plus,
+  Zap, GitCompare, ShieldCheck, ShieldAlert, Layers, Wand2,
+} from 'lucide-react';
 import { Finding, SimulationResult, ModelSummary, ScenarioSummary, TimelinePoint } from './types';
 import { applyFix, recommendFixes, RecommendedFix } from './lib/recommendations';
 
@@ -67,12 +70,36 @@ const PINNED_LAYOUTS: Record<string, Record<string, { x: number; y: number }>> =
   },
 };
 
+const fixIdOf = (f: any): string => f?.fix_id || f?.id || '';
+const scenarioLabel = (s: any): string => {
+  if (!s) return '';
+  if (typeof s === 'string') return s;
+  if (s.name) return s.name;
+  if (s.scenario_id) return s.scenario_id;
+  if (s.description) return String(s.description).slice(0, 80);
+  return 'AI scenario';
+};
+const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
+const STATUS_RANK: Record<string, number> = {
+  ok: 0,
+  degraded: 1,
+  slow_recovery: 2,
+  no_recovery: 3,
+};
+const numericDelta = (before: any, after: any): number | null => {
+  if (typeof before !== 'number' || typeof after !== 'number') return null;
+  return after - before;
+};
+const cellText = (v: any): string =>
+  v === undefined || v === null ? '—' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+
 export default function App() {
   const [models, setModels] = useState<ModelSummary[]>([]);
   const [scenarios, setScenarios] = useState<ScenarioSummary[]>([]);
   const [selectedModelId, setSelectedModelId] = useState<string>('ecommerce_checkout');
   const [selectedScenarioId, setSelectedScenarioId] = useState<string>('03_cache_kill_at_peak');
   const [designMode, setDesignMode] = useState<'before' | 'after' | 'compare'>('before');
+  const [activeNav, setActiveNav] = useState<string>('architecture');
 
   const [rawModel, setRawModel] = useState<any>(null);
   const [rawYaml, setRawYaml] = useState<string>('');
@@ -86,6 +113,24 @@ export default function App() {
   const [recommendations, setRecommendations] = useState<RecommendedFix[]>([]);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [appliedFixes, setAppliedFixes] = useState<Set<string>>(new Set());
+
+  // ---- AI-native workflow state ----
+  const [isCreatingNew, setIsCreatingNew] = useState(false);
+  const [aiScenarios, setAiScenarios] = useState<any[]>([]);
+  const [selectedAiScenario, setSelectedAiScenario] = useState<any | null>(null);
+  const [aiFixes, setAiFixes] = useState<any[]>([]);
+  const [selectedFixIds, setSelectedFixIds] = useState<Set<string>>(new Set());
+  const [baselineModel, setBaselineModel] = useState<any | null>(null);
+  const [compareData, setCompareData] = useState<any | null>(null);
+  const [currentFingerprint, setCurrentFingerprint] = useState<string | null>(null);
+  const [lastDiff, setLastDiff] = useState<any | null>(null);
+  const [aiStatus, setAiStatus] = useState('');
+  const [aiWarnings, setAiWarnings] = useState<string[]>([]);
+  const [generatingScenarios, setGeneratingScenarios] = useState(false);
+  const [remediating, setRemediating] = useState(false);
+  const [applyingFixes, setApplyingFixes] = useState(false);
+  const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
+  const skipScenarioFetchRef = useRef<string | null>(null);
 
   // Interactive Timeline Replay
   const [simTime, setSimTime] = useState<number>(0);
@@ -124,6 +169,20 @@ export default function App() {
     ...(rawScenario?.events ?? []).map((e: any) => ({ t: e.at_s, kind: e.action })),
   ];
 
+  const currentScenarioObject: any = selectedAiScenario?.scenario ?? rawScenario ?? null;
+  const currentPassed: boolean | null = result
+    ? (typeof (result as any).passed === 'boolean'
+        ? (result as any).passed
+        : (!result.slo_breached && result.status === 'ok'))
+    : null;
+  const selectedFixes = aiFixes.filter((f) => selectedFixIds.has(fixIdOf(f)));
+  const fpShort = currentFingerprint ? currentFingerprint.slice(0, 8) : '—';
+
+  const focusSection = (id: string, mode?: 'before' | 'after' | 'compare') => {
+    if (mode) setDesignMode(mode);
+    requestAnimationFrame(() => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+  };
+
   // 1. Initial Load: Fetch models & scenarios
   useEffect(() => {
     fetch(`/api/models`)
@@ -145,14 +204,22 @@ export default function App() {
       .catch((e) => console.error('Failed to list scenarios', e));
   }, []);
 
-  // 1b. Load scenario detail when selectedScenarioId changes
+  // 1b. Load scenario detail when selectedScenarioId changes (AI-generated ids are skipped).
   useEffect(() => {
     if (!selectedScenarioId) return;
+    if (skipScenarioFetchRef.current === selectedScenarioId) {
+      skipScenarioFetchRef.current = null;
+      return;
+    }
     setRawScenario(null);
+    setSelectedAiScenario(null);
     setResult(null);
     setBaselineResult(null);
     setRecommendations([]);
     setAppliedFixes(new Set());
+    setAiFixes([]);
+    setSelectedFixIds(new Set());
+    setCompareData(null);
     setDesignMode('before');
     setSimError(null);
     setIsPlaying(false);
@@ -170,12 +237,17 @@ export default function App() {
       .then((r) => r.json())
       .then((d) => {
         setRawModel(d.data);
-        const yText = yaml.dump(d.data, { indent: 2 });
-        setRawYaml(yText);
+        setRawYaml(yaml.dump(d.data, { indent: 2 }));
         setBaselineResult(null);
         setResult(null);
         setRecommendations([]);
         setAppliedFixes(new Set());
+        setAiFixes([]);
+        setSelectedFixIds(new Set());
+        setAiScenarios([]);
+        setSelectedAiScenario(null);
+        setCompareData(null);
+        setLastDiff(null);
         setDesignMode('before');
         if (d.data?.nodes && d.data.nodes.length > 0) {
           const first = d.data.nodes.find((n: any) => n.type === 'service') || d.data.nodes[0];
@@ -202,13 +274,62 @@ export default function App() {
     }
   };
 
-  // 4. Run Simulation
-  const handleRunSimulation = async (modelToRun?: any) => {
+  // 4a. Ask Gemini for discrete remediation proposals after any failed run.
+  const requestAiFixes = async (
+    arch: any,
+    sim: SimulationResult,
+    analysisFindings: Finding[],
+    fingerprint: string | null
+  ) => {
+    setRemediating(true);
+    setAiStatus('Gemini is diagnosing the failure…');
+    setAiFixes([]);
+    setSelectedFixIds(new Set());
+    try {
+      const res = await fetch('/api/ai/remediate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          architecture: arch,
+          simulation_result: sim,
+          findings: analysisFindings,
+          count: 3,
+          architecture_fingerprint: fingerprint,
+        }),
+      });
+      if (!res.ok) {
+        let message = `Server error (${res.status})`;
+        try {
+          const err = await res.json();
+          if (err?.detail) message = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
+        } catch { /* keep generic message */ }
+        throw new Error(message);
+      }
+      const data = await res.json();
+      const fixes = Array.isArray(data.fixes) ? data.fixes : [];
+      setAiFixes(fixes);
+      setAiWarnings(Array.isArray(data.warnings) ? data.warnings : []);
+      setAiStatus(`${fixes.length} discrete fix${fixes.length === 1 ? '' : 'es'} proposed — review and approve.`);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.error('AI remediation failed', e);
+      setAiStatus(`Remediation unavailable: ${message}`);
+    } finally {
+      setRemediating(false);
+    }
+  };
+
+  // 4b. Run Simulation (optionally with an explicit architecture + explicit scenario dict).
+  const handleRunSimulation = async (
+    modelToRun?: any,
+    scenarioOverride?: any
+  ): Promise<SimulationResult | null> => {
     setSimulating(true);
     setIsPlaying(false);
     setSimError(null);
+    setAiWarnings([]);
     try {
-      const payload = modelToRun || rawModel || selectedModelId;
+      const payload = modelToRun ?? rawModel ?? selectedModelId;
       const arch = typeof payload === 'string'
         ? (await (await fetch(`/api/models/${payload}`)).json()).data
         : payload;
@@ -227,8 +348,9 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          architecture: payload,
-          scenario: selectedScenarioId,
+          architecture: arch,
+          scenario: scenarioOverride ?? rawScenario ?? selectedScenarioId,
+          seed: 42,
         }),
       });
       if (!res.ok) {
@@ -245,20 +367,272 @@ export default function App() {
         throw new Error(errMessage);
       }
       const data: SimulationResult = await res.json();
+      if (data.architecture_fingerprint) setCurrentFingerprint(data.architecture_fingerprint);
       setResult(data);
       setBaselineResult((prev) => prev ?? data);
       setRecommendations(recommendFixes(arch, data, analysis.findings || []));
       setSimTime(data.cascade?.[0]?.t ?? data.warmup_s ?? 0);
+
+      const passed = typeof (data as any).passed === 'boolean'
+        ? (data as any).passed
+        : (!data.slo_breached && data.status === 'ok');
+      if (passed) {
+        setAiFixes([]);
+        setSelectedFixIds(new Set());
+        setAiStatus('Survived the scenario — nothing to fix.');
+      } else {
+        await requestAiFixes(arch, data, analysis.findings || [], data.architecture_fingerprint ?? currentFingerprint);
+      }
+      return data;
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       console.error('Simulation run failed', e);
       setSimError(message);
+      setAiStatus(`Simulation failed: ${message}`);
+      return null;
     } finally {
       setSimulating(false);
     }
   };
 
-  // 5. Timeline Play/Pause Loop
+  // 4c. Generate adversarial scenarios with Gemini, then run one directly.
+  const handleGenerateScenarios = async () => {
+    if (!rawModel) return;
+    setGeneratingScenarios(true);
+    setAiStatus('Gemini is drafting adversarial scenarios…');
+    setAiWarnings([]);
+    try {
+      const res = await fetch('/api/ai/adversary', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          architecture: rawModel,
+          count: 3,
+          seed: 42,
+          exclude_ids: [],
+          include_analysis: true,
+        }),
+      });
+      if (!res.ok) {
+        let message = `Server error (${res.status})`;
+        try {
+          const err = await res.json();
+          if (err?.detail) message = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
+        } catch { /* keep generic message */ }
+        throw new Error(message);
+      }
+      const data = await res.json();
+      const items = Array.isArray(data.scenarios) ? data.scenarios : [];
+      setAiScenarios(items);
+      setAiWarnings(Array.isArray(data.warnings) ? data.warnings : []);
+      setAiStatus(items.length ? `${items.length} scenarios ready — click one to break the architecture.` : 'No scenarios were generated.');
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.error('Scenario generation failed', e);
+      setAiStatus(`Scenario generation failed: ${message}`);
+      setAiScenarios([]);
+    } finally {
+      setGeneratingScenarios(false);
+    }
+  };
+
+  const handleRunAiScenario = (item: any) => {
+    if (!rawModel || !item?.scenario) return;
+    // AI ids do not exist on disk — skip the scenario-detail effect for these ids.
+    skipScenarioFetchRef.current = item.scenario_id;
+    setRawScenario(item.scenario);
+    setSelectedScenarioId(item.scenario_id);
+    setSelectedAiScenario(item);
+    setAiFixes([]);
+    setSelectedFixIds(new Set());
+    setCompareData(null);
+    setDesignMode('before');
+    handleRunSimulation(rawModel, item.scenario);
+  };
+
+  // 5. New architecture / prompt-driven modification via text-to-model.
+  const handleNewArchitecture = () => {
+    setIsCreatingNew(true);
+    setPromptText('');
+    setPromptError(null);
+    setDrawerTab('prompt');
+    setIsDrawerOpen(true);
+    setAiStatus('Draft mode: describe a new architecture below.');
+    focusSection('arch-stage');
+  };
+
+  const handleApplyPrompt = async () => {
+    if (!promptText.trim()) return;
+    const mode = isCreatingNew ? 'create' : 'modify';
+    const scenarioForRun = selectedAiScenario?.scenario ?? rawScenario ?? selectedScenarioId;
+    setIsApplyingPrompt(true);
+    setPromptError(null);
+    setThinkingSteps([mode === 'create' ? 'Reading the brief…' : 'Reading current architecture…']);
+    try {
+      setThinkingSteps((prev) => [...prev, mode === 'create' ? 'Designing the topology…' : 'Applying the requested change…']);
+      await new Promise((resolve) => setTimeout(resolve, 260));
+
+      const res = await fetch('/api/ai/text-to-model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          description: promptText.trim(),
+          name: isCreatingNew ? undefined : rawModel?.name,
+          mode,
+          current_architecture: isCreatingNew ? null : rawModel,
+        }),
+      });
+
+      setThinkingSteps((prev) => [...prev, 'Validating schema…']);
+      if (!res.ok) {
+        let message = `Server error (${res.status})`;
+        try {
+          const err = await res.json();
+          if (err?.detail) message = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
+        } catch { /* keep generic message */ }
+        throw new Error(message);
+      }
+      const data = await res.json();
+      if (!data?.architecture) throw new Error('The model compiler did not return an architecture.');
+
+      setRawModel(data.architecture);
+      setRawYaml(data.yaml || yaml.dump(data.architecture, { indent: 2 }));
+      setCurrentFingerprint(data.fingerprint ?? null);
+      setLastDiff(data.diff ?? null);
+      setAiWarnings(Array.isArray(data.warnings) ? data.warnings : []);
+      setSelectedNodeId(data.architecture.nodes?.find((n: any) => n.type === 'service')?.id || data.architecture.nodes?.[0]?.id || '');
+      setPromptText('');
+      setIsDrawerOpen(false);
+      setIsCreatingNew(false);
+      setAiScenarios([]);
+      setSelectedAiScenario(null);
+      setAiFixes([]);
+      setSelectedFixIds(new Set());
+      setCompareData(null);
+      setBaselineModel(null);
+      setBaselineResult(null);
+      setDesignMode('before');
+      setAiStatus(mode === 'create'
+        ? `New architecture created · ${data.node_count ?? data.architecture.nodes?.length ?? 0} nodes.`
+        : `Change applied · ${data.diff?.changes?.length ?? 0} patch operation(s).`);
+      if (mode === 'create') setSelectedModelId('');
+
+      await runStaticAnalysis(data.architecture);
+      if (scenarioForRun) await handleRunSimulation(data.architecture, scenarioForRun);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.error('Prompt application failed', e);
+      setPromptError(message);
+      setAiStatus(`Prompt failed: ${message}`);
+    } finally {
+      setIsApplyingPrompt(false);
+      setThinkingSteps([]);
+    }
+  };
+
+  // 6. Apply selected AI fixes atomically, re-simulate, and compare.
+  const toggleFix = (id: string) => {
+    setSelectedFixIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleSimulateSelectedFixes = async () => {
+    if (!rawModel || !selectedFixes.length) return;
+    const scenarioForRun = currentScenarioObject ?? selectedScenarioId;
+    const beforeModel = clone(rawModel);
+    const beforeResult = result;
+    const beforeFingerprint = currentFingerprint;
+
+    setApplyingFixes(true);
+    setAiStatus(`Applying ${selectedFixes.length} fix(es) atomically…`);
+    setCompareData(null);
+    try {
+      const patch = {
+        base_fingerprint: beforeFingerprint ?? undefined,
+        ops: selectedFixes.flatMap((f) => (Array.isArray(f.patch?.ops) ? f.patch.ops : [])),
+      };
+      const res = await fetch('/api/architectures/patch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          architecture: rawModel,
+          patch,
+          fix_ids: selectedFixes.map(fixIdOf),
+        }),
+      });
+      if (!res.ok) {
+        let message = `Server error (${res.status})`;
+        try {
+          const err = await res.json();
+          if (err?.detail) message = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
+        } catch { /* keep generic message */ }
+        throw new Error(message);
+      }
+      const data = await res.json();
+      const patched = data.architecture;
+
+      setBaselineModel(beforeModel);
+      setBaselineResult(beforeResult);
+      setRawModel(patched);
+      setRawYaml(data.yaml || yaml.dump(patched, { indent: 2 }));
+      setCurrentFingerprint(data.fingerprint ?? null);
+      setLastDiff(data.diff ?? null);
+      setSelectedFixIds(new Set());
+      setDesignMode('after');
+      await runStaticAnalysis(patched);
+
+      // Re-run against the exact same scenario the baseline failed on.
+      const afterResult = await handleRunSimulation(patched, scenarioForRun);
+
+      // Build the comparison from the two runs we already performed. Re-running
+      // /api/compare here would duplicate both simulations (and can take minutes
+      // for long scenarios), which made the UI feel stalled.
+      const bStatus = String(beforeResult?.status || 'ok');
+      const aStatus = String(afterResult?.status || 'ok');
+      const rankBefore = STATUS_RANK[bStatus] ?? 1;
+      const rankAfter = STATUS_RANK[aStatus] ?? 1;
+      const statusChange = rankAfter < rankBefore ? 'better' : rankAfter > rankBefore ? 'worse' : 'same';
+      setCompareData({
+        scenarios: [{
+          scenario: scenarioLabel(scenarioForRun) || selectedScenarioId,
+          before_run: beforeResult,
+          after_run: afterResult,
+          delta: {
+            status_change: statusChange,
+            error_rate_delta: numericDelta(beforeResult?.error_rate, afterResult?.error_rate),
+            p99_delta_ms: numericDelta(beforeResult?.p99_ms, afterResult?.p99_ms),
+            recovery_delta_s: numericDelta(beforeResult?.recovery_s, afterResult?.recovery_s),
+            breach_seconds_delta: numericDelta(beforeResult?.breach_seconds, afterResult?.breach_seconds),
+            first_breach_delta_s: numericDelta(beforeResult?.first_breach_s, afterResult?.first_breach_s),
+            last_breach_delta_s: numericDelta(beforeResult?.last_breach_s, afterResult?.last_breach_s),
+          },
+        }],
+        findings: { new: [], resolved: [] },
+        summary: {
+          regressions: rankAfter > rankBefore ? 1 : 0,
+          improvements: rankAfter < rankBefore ? 1 : 0,
+          new_findings: 0,
+          resolved_findings: 0,
+        },
+      });
+      setDesignMode('compare');
+      setActiveNav('compare');
+      setAiStatus(`${selectedFixes.length} fix(es) applied — before / after ready.`);
+      focusSection('compare-sec');
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.error('Applying fixes failed', e);
+      setAiStatus(`Could not apply fixes: ${message}`);
+    } finally {
+      setApplyingFixes(false);
+    }
+  };
+
+  // 7. Timeline Play/Pause Loop
   useEffect(() => {
     if (isPlaying) {
       playTimerRef.current = setInterval(() => {
@@ -296,7 +670,7 @@ export default function App() {
     return bits.join(' · ');
   };
 
-  // 6. Timeline Continuous Drag-Scrubbing
+  // 8. Timeline Continuous Drag-Scrubbing
   const updateTimelineScrub = (clientX: number, target: SVGSVGElement) => {
     const rect = target.getBoundingClientRect();
     const x = ((clientX - rect.left) / rect.width) * 1000;
@@ -304,7 +678,7 @@ export default function App() {
     setSimTime(newT);
   };
 
-  // 7. Graph Auto-Layout with Pinned Fallback
+  // 9. Graph Auto-Layout with Pinned Fallback
   const layoutGraph = (): { nodes: LayoutNode[]; edges: LayoutEdge[]; ingressTarget: string } => {
     if (!rawModel || !rawModel.nodes) {
       return { nodes: [], edges: [], ingressTarget: 'lb' };
@@ -445,7 +819,7 @@ export default function App() {
     return `M${x1} ${p.y} C${mx} ${p.y} ${mx} ${q.y} ${x2} ${q.y}`;
   };
 
-  // 8. Apply an evidence-based fix, then re-simulate with the changed architecture.
+  // 10. Legacy static recommendation (kept for manual exploration).
   const handleApplyRecommendedFix = (fix: RecommendedFix) => {
     if (!rawModel) return;
     const changed = applyFix(rawModel, fix);
@@ -454,125 +828,10 @@ export default function App() {
     setAppliedFixes((prev) => new Set([...prev, fix.id]));
     setDesignMode('after');
     runStaticAnalysis(changed);
-    handleRunSimulation(changed);
+    handleRunSimulation(changed, currentScenarioObject ?? selectedScenarioId);
   };
 
-  // 9. Prompt-based architecture modification powered by Vertex AI
-  const handleApplyPrompt = async () => {
-    if (!promptText.trim()) return;
-    setIsApplyingPrompt(true);
-    setPromptError(null);
-
-    try {
-      // 1. Try Vertex AI text-to-model compiler first
-      const res = await fetch('/api/ai/text-to-model', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          description: promptText.trim(),
-          name: rawModel?.name ? `${rawModel.name}_custom` : 'custom_architecture'
-        }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.architecture) {
-          setRawModel(data.architecture);
-          setRawYaml(data.yaml);
-          setPromptText('');
-          setIsDrawerOpen(false);
-          runStaticAnalysis(data.architecture);
-          handleRunSimulation(data.architecture);
-          return;
-        }
-      }
-
-      // If text-to-model returned non-ok, log for diagnostics
-      try {
-        const errJson = await res.json();
-        console.warn('Vertex AI prompt compiler returned non-200:', errJson.detail);
-      } catch {
-        // ignore parse error on fallback
-      }
-
-      // 2. Fallback: intelligent in-memory patch with strictly valid node references
-      const lower = promptText.toLowerCase();
-      const clone = JSON.parse(JSON.stringify(rawModel || {}));
-      if (!clone.nodes) clone.nodes = [];
-      if (!clone.edges) clone.edges = [];
-
-      if (lower.includes('cache') || lower.includes('redis')) {
-        if (!clone.nodes.some((n: any) => n.id === 'redis' || n.id === 'cache')) {
-          clone.nodes.push({
-            id: 'redis',
-            type: 'cache',
-            replicas: 2,
-            concurrency_per_replica: 1000,
-            latency_ms: { p50: 2, p99: 5 },
-            warm_hit_rate: 0.9,
-            cold_hit_rate: 0.1,
-            warmup_s: 180,
-          });
-        }
-      }
-
-      if (lower.includes('replica') || lower.includes('scale')) {
-        clone.nodes.forEach((n: any) => {
-          if (n.type === 'datastore' && (!n.read_replicas || n.read_replicas.length === 0)) {
-            const rep1 = `${n.id}-replica-1`;
-            const rep2 = `${n.id}-replica-2`;
-            n.read_replicas = [rep1, rep2];
-            n.read_fallback = true;
-            if (!clone.nodes.some((x: any) => x.id === rep1)) {
-              clone.nodes.push({
-                id: rep1,
-                type: 'datastore',
-                replicas: 1,
-                concurrency_per_replica: n.concurrency_per_replica || 25,
-                queue_per_replica: n.queue_per_replica || 100,
-                latency_ms: n.latency_ms ? { ...n.latency_ms } : { p50: 15, p99: 60 }
-              });
-            }
-            if (!clone.nodes.some((x: any) => x.id === rep2)) {
-              clone.nodes.push({
-                id: rep2,
-                type: 'datastore',
-                replicas: 1,
-                concurrency_per_replica: n.concurrency_per_replica || 25,
-                queue_per_replica: n.queue_per_replica || 100,
-                latency_ms: n.latency_ms ? { ...n.latency_ms } : { p50: 15, p99: 60 }
-              });
-            }
-          } else if (n.type === 'service') {
-            n.replicas = (n.replicas || 1) + 1;
-          }
-        });
-      }
-
-      if (lower.includes('jitter') || lower.includes('backoff')) {
-        clone.edges.forEach((e: any) => {
-          if (e.retry?.attempts) {
-            e.retry.backoff = 'exponential';
-            e.retry.jitter = true;
-          }
-        });
-      }
-
-      setRawModel(clone);
-      setRawYaml(yaml.dump(clone, { indent: 2 }));
-      setPromptText('');
-      setIsDrawerOpen(false);
-      runStaticAnalysis(clone);
-      handleRunSimulation(clone);
-    } catch (e: any) {
-      console.error('Prompt application failed:', e);
-      setPromptError(e.message || 'Failed to apply prompt changes.');
-    } finally {
-      setIsApplyingPrompt(false);
-    }
-  };
-
-  // 10. Manual YAML Spec Editor apply
+  // 11. Manual YAML Spec Editor apply
   const handleApplySpec = () => {
     try {
       const parsed: any = yaml.load(rawYaml);
@@ -581,15 +840,17 @@ export default function App() {
         return;
       }
       setRawModel(parsed);
+      setCurrentFingerprint(null);
+      setLastDiff(null);
       runStaticAnalysis(parsed);
       setIsDrawerOpen(false);
-      handleRunSimulation(parsed);
+      handleRunSimulation(parsed, currentScenarioObject ?? selectedScenarioId);
     } catch (e: any) {
       alert(`YAML Parse Error: ${e.message}`);
     }
   };
 
-  // 11. Export & Import
+  // 12. Export & Import
   const handleExportYaml = () => {
     const text = rawYaml || yaml.dump(rawModel, { indent: 2 });
     const blob = new Blob([text], { type: 'text/yaml' });
@@ -620,9 +881,11 @@ export default function App() {
         }
         setRawModel(parsed);
         setRawYaml(yaml.dump(parsed, { indent: 2 }));
+        setCurrentFingerprint(null);
+        setLastDiff(null);
         setImportStatus(`Successfully loaded "${parsed.name || file.name}"!`);
         runStaticAnalysis(parsed);
-        handleRunSimulation(parsed);
+        handleRunSimulation(parsed, currentScenarioObject ?? selectedScenarioId);
       } catch (err: any) {
         setImportStatus(`Failed to parse file: ${err.message}`);
       }
@@ -630,210 +893,207 @@ export default function App() {
     reader.readAsText(file);
   };
 
+  // ---- Compare panel helpers ----
+  const metric = (run: any, keys: string[]): number | null => {
+    for (const k of keys) {
+      const v = run?.[k];
+      if (typeof v === 'number') return v;
+    }
+    return null;
+  };
+  const fmtPct = (v: number | null) => v === null ? '—' : `${(v * 100).toFixed(1)}%`;
+  const fmtMs = (v: number | null) => v === null ? '—' : `${Math.round(v)}ms`;
+  const fmtSecs = (v: number | null) => v === null ? '—' : `${Math.round(v)}s`;
+  const deltaText = (b: number | null, a: number | null, unit: 'pp' | 'ms' | 's') => {
+    if (b === null || a === null) return '—';
+    const d = a - b;
+    if (Math.abs(d) < 1e-9) return 'no change';
+    const magnitude = unit === 'pp' ? `${(Math.abs(d) * 100).toFixed(1)}pp` : `${Math.round(Math.abs(d))}${unit}`;
+    return `${d < 0 ? '▼' : '▲'} ${magnitude}`;
+  };
+
+  const cmpScenario = compareData?.scenarios?.[0] ?? {};
+  const statusDelta = cmpScenario?.delta?.status_change;
+  const verdictDelta = statusDelta === 'better' ? 'improved' : statusDelta === 'worse' ? 'regressed' : statusDelta === 'same' ? 'same verdict' : (currentPassed === true ? 'survived' : '—');
+  const beforeRun = cmpScenario.before_run ?? compareData?.before ?? baselineResult;
+  const afterRun = cmpScenario.after_run ?? compareData?.after ?? result;
+  const bErr = metric(beforeRun, ['error_rate', 'peak_error_rate']);
+  const aErr = metric(afterRun, ['error_rate', 'peak_error_rate']);
+  const bP99 = metric(beforeRun, ['p99_ms']);
+  const aP99 = metric(afterRun, ['p99_ms']);
+  const bRec = metric(beforeRun, ['recovery_s']);
+  const aRec = metric(afterRun, ['recovery_s']);
+  const bBreach = metric(beforeRun, ['breach_seconds', 'first_breach_s']);
+  const aBreach = metric(afterRun, ['breach_seconds', 'first_breach_s']);
+
+  const compareMetrics = [
+    { label: 'Verdict', before: cellText(beforeRun?.status), after: cellText(afterRun?.status), delta: verdictDelta },
+    { label: 'Error rate', before: fmtPct(bErr), after: fmtPct(aErr), delta: deltaText(bErr, aErr, 'pp') },
+    { label: 'p99 latency', before: fmtMs(bP99), after: fmtMs(aP99), delta: deltaText(bP99, aP99, 'ms') },
+    { label: 'Recovery', before: fmtSecs(bRec), after: fmtSecs(aRec), delta: deltaText(bRec, aRec, 's') },
+    { label: 'First breach', before: fmtSecs(bBreach), after: fmtSecs(aBreach), delta: deltaText(bBreach, aBreach, 's') },
+  ];
+
+  const findingsNew = Array.isArray(compareData?.findings?.new) ? compareData.findings.new : [];
+  const findingsResolved = Array.isArray(compareData?.findings?.resolved) ? compareData.findings.resolved : [];
+  const diffRows: any[] = findingsNew.length || findingsResolved.length
+    ? [
+        ...findingsNew.map((x: any) => ({
+          kind: 'new',
+          path: typeof x === 'string' ? x : (x.target || x.path || x.rule || 'finding'),
+          before: '—',
+          after: typeof x === 'string' ? 'introduced' : (x.message || x.fix || 'introduced'),
+        })),
+        ...findingsResolved.map((x: any) => ({
+          kind: 'resolved',
+          path: typeof x === 'string' ? x : (x.target || x.path || x.rule || 'finding'),
+          before: typeof x === 'string' ? 'present' : (x.message || 'present'),
+          after: '—',
+        })),
+      ]
+    : (Array.isArray(lastDiff?.changes)
+        ? lastDiff.changes.map((c: any) => ({ kind: c.op || 'changed', path: c.path || '—', before: c.before, after: c.after }))
+        : []);
+
   const selectedNode = nodesById[selectedNodeId] || graphNodes[0];
   const selectedNodeState = selectedNode ? getNodeState(selectedNode.id) : null;
 
   return (
     <div className="app">
-      {/* ===== TOP BAR (Task-Driven Header) ===== */}
-      <header className="top">
+      {/* ===== FIXED LEFT SIDEBAR ===== */}
+      <aside className="sidebar">
         <div className="brand">
           <div className="logo">V</div>
-          <span>Project Venessa</span>
+          <span>VENESSA</span>
         </div>
+        <div className="micro sidebar-label">Workbench</div>
+        <nav className="side-nav" aria-label="Sections">
+          <button type="button" className={`nav-item ${activeNav === 'architecture' ? 'active' : ''}`} onClick={() => { setActiveNav('architecture'); focusSection('arch-stage', 'before'); }}>
+            <Layers className="w-3.5 h-3.5" /> Architecture
+          </button>
+          <button type="button" className={`nav-item ${activeNav === 'scenarios' ? 'active' : ''}`} onClick={() => { setActiveNav('scenarios'); focusSection('scenarios-sec'); }}>
+            <Zap className="w-3.5 h-3.5" /> Scenarios
+          </button>
+          <button type="button" className={`nav-item ${activeNav === 'simulate' ? 'active' : ''}`} onClick={() => { setActiveNav('simulate'); focusSection('verdict-sec'); }}>
+            <Play className="w-3.5 h-3.5" /> Simulate
+          </button>
+          <button type="button" className={`nav-item ${activeNav === 'fixes' ? 'active' : ''}`} onClick={() => { setActiveNav('fixes'); focusSection('fixes-sec'); }}>
+            <ShieldAlert className="w-3.5 h-3.5" /> Fixes
+            {aiFixes.length > 0 && <span className="nav-count">{aiFixes.length}</span>}
+          </button>
+          <button type="button" className={`nav-item ${activeNav === 'compare' ? 'active' : ''}`} onClick={() => { setActiveNav('compare'); focusSection('compare-sec', 'compare'); }}>
+            <GitCompare className="w-3.5 h-3.5" /> Compare
+          </button>
+        </nav>
+        <div className="sidebar-bottom context-card">
+          <div className="micro">Active model</div>
+          <b className="model-name">{rawModel?.name || selectedModelId || 'untitled architecture'}</b>
+          <div className="sidebar-stats">
+            <span>{rawModel?.nodes?.length ?? 0} nodes</span>
+            <span>{rawModel?.edges?.length ?? 0} edges</span>
+          </div>
+          <div className="micro">fp {fpShort}</div>
+        </div>
+      </aside>
 
-        <nav className="crumbs" aria-label="Run setup">
+      {/* ===== TOP COMMAND STRIP ===== */}
+      <header className="top">
+        <div className="command-group">
           <div className="pick">
             <small>Model</small>
-            <select
-              value={selectedModelId}
-              onChange={(e) => setSelectedModelId(e.target.value)}
-            >
+            <select value={selectedModelId} onChange={(e) => setSelectedModelId(e.target.value)}>
+              {!selectedModelId && <option value="">{rawModel?.name || 'generated architecture'}</option>}
               {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name || m.id}
-                </option>
+                <option key={m.id} value={m.id}>{m.name || m.id}</option>
               ))}
             </select>
           </div>
-
-          <span className="sep">×</span>
-
+          <span className="sep">/</span>
           <div className="pick">
             <small>Scenario</small>
-            <select
-              value={selectedScenarioId}
-              onChange={(e) => setSelectedScenarioId(e.target.value)}
-            >
+            <select value={selectedScenarioId} onChange={(e) => setSelectedScenarioId(e.target.value)}>
+              {selectedAiScenario && <option value={selectedScenarioId}>{scenarioLabel(selectedAiScenario.scenario) || selectedScenarioId}</option>}
               {scenarios.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name || s.id}
-                </option>
+                <option key={s.id} value={s.id}>{s.name || s.id}</option>
               ))}
             </select>
           </div>
-
-          <span className="chip">seed 42</span>
-        </nav>
+          <span className="status-pill">seed 42</span>
+        </div>
 
         <div className="spacer"></div>
 
-        {/* Version Switcher */}
         <div className="seg" role="group" aria-label="Design version">
-          <button
-            type="button"
-            className={designMode === 'before' ? 'active' : ''}
-            onClick={() => setDesignMode('before')}
-          >
-            Current design
-          </button>
-          <button
-            type="button"
-            className={designMode === 'after' ? 'active' : ''}
-            onClick={() => setDesignMode('after')}
-          >
-            With fixes
-          </button>
-          <button
-            type="button"
-            className={designMode === 'compare' ? 'active' : ''}
-            onClick={() => setDesignMode('compare')}
-          >
-            Compare
-          </button>
+          <button type="button" className={designMode === 'before' ? 'active' : ''} onClick={() => setDesignMode('before')}>Before</button>
+          <button type="button" className={designMode === 'after' ? 'active' : ''} onClick={() => setDesignMode('after')}>After</button>
+          <button type="button" className={designMode === 'compare' ? 'active' : ''} onClick={() => { setDesignMode('compare'); setActiveNav('compare'); }}>Compare</button>
         </div>
 
-        {/* Action Buttons: Prompt, Import, Export */}
-        <button
-          type="button"
-          className="action-btn"
-          onClick={() => {
-            setDrawerTab('prompt');
-            setIsDrawerOpen(true);
-          }}
-        >
-          <Sparkles className="w-4 h-4 text-accent" />
-          <span>Prompt &amp; Edit</span>
+        <button type="button" className="action-btn" onClick={handleNewArchitecture}>
+          <Plus className="w-3.5 h-3.5" /><span>New architecture</span>
         </button>
-
-        <button type="button" className="action-btn" onClick={handleExportYaml} title="Export YAML">
-          <Download className="w-3.5 h-3.5" />
-          <span>Export</span>
+        <button type="button" className="action-btn" onClick={() => { setIsCreatingNew(false); setDrawerTab('prompt'); setIsDrawerOpen(true); }}>
+          <Sparkles className="w-3.5 h-3.5 text-accent" /><span>Prompt &amp; Edit</span>
         </button>
+        <button type="button" className="action-btn icon-only" onClick={handleExportYaml} title="Export YAML"><Download className="w-3.5 h-3.5" /></button>
+        <button type="button" className="action-btn icon-only" onClick={() => fileInputRef.current?.click()} title="Import YAML / JSON"><Upload className="w-3.5 h-3.5" /></button>
+        <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept=".yaml,.yml,.json" style={{ display: 'none' }} />
 
-        <button
-          type="button"
-          className="action-btn"
-          onClick={() => fileInputRef.current?.click()}
-          title="Import YAML / JSON"
-        >
-          <Upload className="w-3.5 h-3.5" />
-          <span>Import</span>
-        </button>
-        <input
-          type="file"
-          ref={fileInputRef}
-          onChange={handleFileUpload}
-          accept=".yaml,.yml,.json"
-          style={{ display: 'none' }}
-        />
-
-        {/* Run Scenario Button */}
-        <button
-          type="button"
-          className="run"
-          onClick={() => handleRunSimulation()}
-          disabled={simulating}
-        >
-          {simulating ? (
-            <>
-              <RefreshCw className="w-4 h-4 animate-spin" />
-              <span>Simulating...</span>
-            </>
-          ) : (
-            <>
-              <Play className="w-4 h-4" />
-              <span>Run scenario</span>
-            </>
-          )}
+        <button type="button" className="run" onClick={() => handleRunSimulation(rawModel, currentScenarioObject ?? selectedScenarioId)} disabled={simulating}>
+          {simulating ? <><RefreshCw className="w-3.5 h-3.5 animate-spin" /><span>Simulating…</span></> : <><Play className="w-3.5 h-3.5" /><span>Run scenario</span></>}
         </button>
       </header>
 
-      {/* ===== MAIN 3-COLUMN LAYOUT (Mock UI 1 Design) ===== */}
-      <main className="main">
-        {/* ===== LEFT COLUMN: Verdict + Scenario Events + Adversary ===== */}
+      {/* ===== WORKBENCH ===== */}
+      <main className="main workbench">
+        {/* LEFT RAIL */}
         <aside className="stack left">
-          {/* Verdict Card */}
-          <section className="card" aria-labelledby="vh">
-            <h2 id="vh">Verdict</h2>
+          <section className="card" id="verdict-sec" aria-labelledby="vh">
+            <h2 id="vh"><span>Verdict</span><span className="chip">{designMode}</span></h2>
             <div className="verdict">
-              <span
-                className="dot"
-                style={{
-                  background:
-                    viewResult?.status === 'ok'
-                      ? 'var(--ok)'
-                      : viewResult?.status === 'degraded' || viewResult?.status === 'slow_recovery'
-                      ? 'var(--warn)'
-                      : 'var(--bad)',
-                }}
-              />
+              <span className="dot" style={{ background: viewResult?.status === 'ok' ? 'var(--green)' : viewResult?.status === 'degraded' || viewResult?.status === 'slow_recovery' ? 'var(--orange)' : 'var(--red)' }} />
               <div>
                 <h3 id="vTitle">
                   {viewResult
                     ? viewResult.status === 'ok'
-                      ? 'Survives Nominal Load'
+                      ? 'Survives nominal load'
                       : viewResult.status === 'degraded' || viewResult.status === 'slow_recovery'
-                      ? 'Degraded, Recovered'
-                      : 'Catastrophic Outage (Metastable)'
-                    : 'Awaiting Simulation'}
+                      ? 'Degraded, recovered'
+                      : 'Catastrophic outage'
+                    : 'Awaiting simulation'}
                 </h3>
                 <p id="vText">
                   {viewResult
                     ? viewResult.slo_breached
-                      ? `Breached SLO for ${viewResult.breach_seconds || 0}s during incident.`
-                      : 'Remained within target SLO envelope throughout.'
-                    : 'Select a scenario to evaluate system stability.'}
+                      ? `Breached SLO for ${viewResult.breach_seconds || 0}s during the incident.`
+                      : 'Remained within the target SLO envelope.'
+                    : 'Pick a scenario and run it to see the verdict.'}
                 </p>
               </div>
             </div>
 
-            {simError && (
-              <p className="sim-error" role="alert">Simulation failed: {simError}</p>
+            {simError && <p className="sim-error" role="alert">Simulation failed: {simError}</p>}
+            {aiStatus && <div className={`insight-card ${aiStatus.startsWith('Prompt failed') || aiStatus.startsWith('Could not') || aiStatus.startsWith('Scenario generation failed') ? 'error' : ''}`}>
+              <span className="micro"> Gemini trace</span>
+              <span>{aiStatus}</span>
+            </div>}
+            {aiWarnings.length > 0 && (
+              <div className="insight-card warn">
+                <span className="micro">Warnings</span>
+                {aiWarnings.map((w, i) => <span key={i}>{typeof w === 'string' ? w : JSON.stringify(w)}</span>)}
+              </div>
             )}
 
             <div className="kpis">
-              <div className="kpi">
-                <small>Peak error rate</small>
-                <b>{viewResult ? `${(viewResult.error_rate * 100).toFixed(1)}%` : '–'}</b>
-              </div>
-              <div className="kpi">
-                <small>Time out of SLO</small>
-                <b>{viewResult?.breach_seconds !== undefined ? `${viewResult.breach_seconds}s` : '–'}</b>
-              </div>
-              <div className="kpi">
-                <small>Recovery</small>
-                <b>
-                  {viewResult?.status === 'ok'
-                    ? 'Instant'
-                    : viewResult?.recovery_s
-                    ? `${viewResult.recovery_s.toFixed(0)}s`
-                    : 'Failed'}
-                </b>
-              </div>
-              <div className="kpi">
-                <small>Failed requests</small>
-                <b>{viewResult ? Math.round(viewResult.requests * viewResult.error_rate).toLocaleString() : '–'}</b>
-              </div>
+              <div className="kpi"><small>Peak error rate</small><b>{viewResult ? `${(viewResult.error_rate * 100).toFixed(1)}%` : '–'}</b></div>
+              <div className="kpi"><small>Time out of SLO</small><b>{viewResult?.breach_seconds !== undefined ? `${viewResult.breach_seconds}s` : '–'}</b></div>
+              <div className="kpi"><small>Recovery</small><b>{viewResult?.status === 'ok' ? 'Instant' : viewResult?.recovery_s ? `${viewResult.recovery_s.toFixed(0)}s` : 'Failed'}</b></div>
+              <div className="kpi"><small>Failed requests</small><b>{viewResult ? Math.round(viewResult.requests * viewResult.error_rate).toLocaleString() : '–'}</b></div>
             </div>
           </section>
 
-          {/* Scenario Timeline Card */}
-          <section className="card" aria-labelledby="sh">
-            <h2 id="sh">
-              <span>Scenario Events</span>
-              <span className="chip">{fmtTime(duration)}</span>
-            </h2>
+          <section className="card" id="scenarios-sec" aria-labelledby="sh">
+            <h2 id="sh"><span>Scenario events</span><span className="chip">{fmtTime(duration)}</span></h2>
             <ul className="events">
               {(rawScenario?.traffic?.ramp ?? []).map((r: any, i: number) => (
                 <li key={`ramp-${i}`}>
@@ -856,12 +1116,51 @@ export default function App() {
             </ul>
           </section>
 
-          {/* AI Adversary Card */}
-          <section className="card" aria-labelledby="ah">
+          <section className="card" id="adversary-sec" aria-labelledby="ah">
             <h2 id="ah">
-              <span>AI Adversary</span>
-              <span className="chip">{scenarios.length} vectors</span>
+              <span>AI adversary</span>
+              <button type="button" className="tiny-btn" onClick={handleGenerateScenarios} disabled={generatingScenarios || !rawModel}>
+                <Zap className="w-3 h-3" />{generatingScenarios ? 'Thinking…' : 'Generate 3'}
+              </button>
             </h2>
+
+            {generatingScenarios && (
+              <div className="thinking">
+                <div className="thinking-step">Reading architecture fingerprint…</div>
+                <div className="thinking-step">Searching for metastable failure paths…</div>
+                <div className="thinking-step">Validating adversarial scenarios…</div>
+              </div>
+            )}
+
+            {aiScenarios.length > 0 && (
+              <div className="scenario-list">
+                {aiScenarios.map((item: any, idx: number) => {
+                  const isSelected = selectedAiScenario?.scenario_id === item.scenario_id;
+                  const targets = Array.isArray(item.target_nodes) ? item.target_nodes.join(', ') : '';
+                  const severity = String(item.severity || item.hypothesis?.severity || (idx === 0 ? 'high' : 'medium')).toLowerCase();
+                  return (
+                    <button
+                      type="button"
+                      key={item.scenario_id || idx}
+                      className={`scenario-card ${isSelected ? 'sel' : ''}`}
+                      onClick={() => handleRunAiScenario(item)}
+                    >
+                      <div className="scenario-top">
+                        <span className={`status-pill ${severity}`}>{severity}</span>
+                        <span className="micro">#{String(idx + 1).padStart(2, '0')}</span>
+                      </div>
+                      <b>{scenarioLabel(item.scenario) || `Scenario ${idx + 1}`}</b>
+                      <p>{item.hypothesis || item.rationale || 'Gemini adversarial hypothesis'}</p>
+                      {targets && <div className="micro">targets · {targets}</div>}
+                      <span className="run-link"><Play className="w-3 h-3" /> Run to verify</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            <div className="dashed" />
+            <div className="micro section-label">Disk scenarios</div>
             <div className="adv">
               {scenarios.map((s) => {
                 const tried = result?.scenario === (s.name || s.id);
@@ -869,7 +1168,7 @@ export default function App() {
                 return (
                   <div
                     key={s.id}
-                    className={`adv-row ${selectedScenarioId === s.id ? 'sel' : ''}`}
+                    className={`adv-row ${selectedScenarioId === s.id && !selectedAiScenario ? 'sel' : ''}`}
                     onClick={() => setSelectedScenarioId(s.id)}
                   >
                     <span>{s.name || s.id}</span>
@@ -878,48 +1177,37 @@ export default function App() {
                 );
               })}
             </div>
-            <div className="adv-sum">
-              Select a stress vector, then run the scenario to verify it with discrete-event simulation.
-            </div>
           </section>
         </aside>
 
-        {/* ===== CENTRE COLUMN: Architecture Stage + Interactive Timeline Replay ===== */}
-        <section className="card stage" aria-labelledby="gh">
+        {/* CENTRE STAGE */}
+        <section className="card stage" id="arch-stage" aria-labelledby="gh">
           <div className="stage-head">
             <h2 id="gh">Architecture</h2>
-            <span className="chip" id="viewChip">
-              {designMode === 'before' ? 'current design' : designMode === 'after' ? 'with fixes' : 'comparison diff'}
-            </span>
+            <span className="chip" id="viewChip">{designMode === 'before' ? 'current design' : designMode === 'after' ? 'with fixes' : 'comparison diff'}</span>
+            {isCreatingNew && <span className="status-pill accent">draft: new</span>}
             <div className="legend">
-              <span><i style={{ background: 'var(--ok)' }} />healthy</span>
-              <span><i style={{ background: 'var(--warn)' }} />strained</span>
-              <span><i style={{ background: 'var(--bad)' }} />down / failing</span>
+              <span><i style={{ background: 'var(--green)' }} />healthy</span>
+              <span><i style={{ background: 'var(--orange)' }} />strained</span>
+              <span><i style={{ background: 'var(--red)' }} />down</span>
               <span><i style={{ background: 'var(--boot)' }} />restarting</span>
             </div>
           </div>
 
-          {/* SVG Animated Architecture Canvas */}
           <div className="graph-wrap">
             <svg id="graph" viewBox="0 0 1000 560" role="img" aria-label="Architecture Graph">
-              {/* Traffic / Users Source */}
               <g className="src">
-                <circle cx={70} cy={280} r={28} fill="none" stroke="var(--muted)" strokeDasharray="3 4" />
+                <circle cx={70} cy={280} r={28} fill="none" stroke="var(--ink-3)" strokeDasharray="3 4" />
                 <text x={70} y={284} textAnchor="middle">Users</text>
-                <text x={70} y={325} textAnchor="middle" style={{ fontSize: '11px', fill: 'var(--muted)', fontFamily: 'var(--mono)' }}>
+                <text x={70} y={325} textAnchor="middle" style={{ fontSize: '11px', fill: 'var(--ink-3)', fontFamily: 'var(--mono)' }}>
                   {viewResult ? `${viewResult.requests.toLocaleString()} req` : '300 rps'}
                 </text>
               </g>
 
-              {/* Ingress Edge from Users to Ingress Node */}
               {ingressTarget && nodesById[ingressTarget] && (
-                <path
-                  d={computeEdgePath('users', ingressTarget)}
-                  className="edge flow"
-                />
+                <path d={computeEdgePath('users', ingressTarget)} className="edge flow" />
               )}
 
-              {/* Render Architecture Edges with Flow Animation */}
               {graphEdges.map((e, idx) => {
                 const isBad = viewResult?.node_errors && (viewResult.node_errors[e.to] || viewResult.client_errors[`${e.from}->${e.to}:timeout`]);
                 return (
@@ -931,19 +1219,10 @@ export default function App() {
                 );
               })}
 
-              {/* Render Architecture Nodes */}
               {graphNodes.map((n) => {
                 const st = getNodeState(n.id);
                 const isSelected = selectedNodeId === n.id;
-                const haloColor =
-                  st.state === 'down'
-                    ? 'var(--bad)'
-                    : st.state === 'warn'
-                    ? 'var(--warn)'
-                    : st.state === 'boot'
-                    ? 'var(--boot)'
-                    : 'var(--accent)';
-
+                const haloColor = st.state === 'down' ? 'var(--red)' : st.state === 'warn' ? 'var(--orange)' : st.state === 'boot' ? 'var(--boot)' : 'var(--accent)';
                 return (
                   <g
                     key={n.id}
@@ -951,43 +1230,11 @@ export default function App() {
                     transform={`translate(${n.x - W / 2}, ${n.y - H / 2})`}
                     onClick={() => setSelectedNodeId(n.id)}
                   >
-                    {/* Glowing Halo */}
-                    <rect
-                      className="halo"
-                      x={-5}
-                      y={-5}
-                      width={W + 10}
-                      height={H + 10}
-                      rx={16}
-                      fill="none"
-                      stroke={haloColor}
-                      strokeWidth={6}
-                    />
-
-                    {/* Node Body */}
+                    <rect className="halo" x={-5} y={-5} width={W + 10} height={H + 10} rx={16} fill="none" stroke={haloColor} strokeWidth={6} />
                     <rect className="body" width={W} height={H} rx={12} />
-
-                    {/* Status indicator stripe */}
-                    <rect
-                      x={0}
-                      y={10}
-                      width={4}
-                      height={H - 20}
-                      rx={2}
-                      fill={st.state === 'ok' ? 'var(--ok)' : st.state === 'warn' ? 'var(--warn)' : 'var(--bad)'}
-                    />
-
-                    {/* Title with Type Icon */}
-                    <text x={16} y={24}>
-                      {ICONS[n.type] || '◆'} {n.label}
-                    </text>
-
-                    {/* Subtitle / State */}
-                    <text x={16} y={42} className="sub">
-                      {st.note || `${n.replicas} rep · ${n.concurrency} slots`}
-                    </text>
-
-                    {/* Capacity Utilization Progress Bar */}
+                    <rect x={0} y={10} width={4} height={H - 20} rx={2} fill={st.state === 'ok' ? 'var(--green)' : st.state === 'warn' ? 'var(--orange)' : 'var(--red)'} />
+                    <text x={16} y={24}>{ICONS[n.type] || '◆'} {n.label}</text>
+                    <text x={16} y={42} className="sub">{st.note || `${n.replicas} rep · ${n.concurrency} slots`}</text>
                     <rect x={16} y={51} width={W - 32} height={4} rx={2} fill="var(--line)" />
                     <rect
                       x={16}
@@ -995,18 +1242,10 @@ export default function App() {
                       width={(W - 32) * Math.min(1, Math.max(0.1, st.util))}
                       height={4}
                       rx={2}
-                      fill={st.state === 'ok' ? 'var(--accent)' : st.state === 'warn' ? 'var(--warn)' : 'var(--bad)'}
+                      fill={st.state === 'ok' ? 'var(--accent)' : st.state === 'warn' ? 'var(--orange)' : 'var(--red)'}
                     />
-
-                    {/* Replica count dots */}
                     {Array.from({ length: Math.min(6, n.replicas) }).map((_, i) => (
-                      <circle
-                        key={i}
-                        cx={W - 14 - i * 10}
-                        cy={19}
-                        r={3.2}
-                        fill={st.state === 'down' ? 'var(--bad)' : 'var(--ok)'}
-                      />
+                      <circle key={i} cx={W - 14 - i * 10} cy={19} r={3.2} fill={st.state === 'down' ? 'var(--red)' : 'var(--green)'} />
                     ))}
                   </g>
                 );
@@ -1014,245 +1253,120 @@ export default function App() {
             </svg>
           </div>
 
-          {/* Interactive Timeline Replay — only available after a run */}
           {viewResult ? (
-          <div className="tl">
-            <div className="tl-head">
-              <button
-                type="button"
-                className="play"
-                onClick={() => setIsPlaying(!isPlaying)}
-                aria-label={isPlaying ? 'Pause' : 'Play'}
+            <div className="tl">
+              <div className="tl-head">
+                <button type="button" className="play" onClick={() => setIsPlaying(!isPlaying)} aria-label={isPlaying ? 'Pause' : 'Play'}>
+                  {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                </button>
+                <div className="clock">t = <b>{fmtTime(simTime)}</b> <span style={{ color: 'var(--ink-3)', fontSize: '11px', marginLeft: '6px' }}>/ {fmtTime(duration)}</span></div>
+                <div className="tl-legend">
+                  <span><i style={{ background: 'var(--red)' }} />{designMode === 'before' ? 'current design' : 'with fixes'}</span>
+                  {baselinePath && <span><i style={{ background: 'var(--ink-3)' }} />baseline</span>}
+                  <span><i style={{ background: 'var(--ink-3)', opacity: 0.5 }} />SLO threshold</span>
+                </div>
+              </div>
+
+              <svg
+                id="timeline"
+                viewBox="0 0 1000 120"
+                preserveAspectRatio="none"
+                onPointerDown={(e) => {
+                  setIsDragging(true);
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  setIsPlaying(false);
+                  updateTimelineScrub(e.clientX, e.currentTarget);
+                }}
+                onPointerMove={(e) => { if (isDragging) updateTimelineScrub(e.clientX, e.currentTarget); }}
+                onPointerUp={() => setIsDragging(false)}
+                onPointerCancel={() => setIsDragging(false)}
               >
-                {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
-              </button>
-              <div className="clock">
-                t = <b>{fmtTime(simTime)}</b> <span style={{ color: 'var(--muted)', fontSize: '11px', marginLeft: '6px' }}>/ {fmtTime(duration)}</span>
-              </div>
-              <div className="tl-legend">
-                <span><i style={{ background: 'var(--bad)' }} />{designMode === 'before' ? 'current design' : 'with fixes'}</span>
-                {baselinePath && <span><i style={{ background: 'var(--muted)' }} />baseline</span>}
-                <span><i style={{ background: 'var(--muted)', opacity: 0.5 }} />SLO threshold</span>
-              </div>
+                {[0, 0.25, 0.5, 0.75, 1].map((v) => {
+                  const y = 100 - v * 80;
+                  return (
+                    <g key={v}>
+                      <line x1={30} x2={990} y1={y} y2={y} stroke="var(--line)" strokeWidth={0.6} />
+                      <text x={2} y={y + 3}>{(errScale * v * 100).toFixed(0)}%</text>
+                    </g>
+                  );
+                })}
+
+                {[0, 1, 2, 3, 4, 5, 6].map((i) => (
+                  <text key={i} x={xFor((i / 6) * duration) - 8} y={114}>{fmtTime((i / 6) * duration)}</text>
+                ))}
+
+                {eventMarkers.map((m, i) => {
+                  const color = m.kind === 'load' ? 'var(--accent)' : ['kill', 'restart'].includes(m.kind) ? 'var(--red)' : m.kind === 'restore' ? 'var(--green)' : 'var(--orange)';
+                  return <line key={i} x1={xFor(m.t)} x2={xFor(m.t)} y1={10} y2={100} stroke={color} strokeWidth={1.1} opacity={0.65} />;
+                })}
+
+                {viewResult?.slo_error_rate !== undefined && (
+                  <line x1={30} x2={990} y1={yFor(viewResult.slo_error_rate)} y2={yFor(viewResult.slo_error_rate)} stroke="var(--ink-3)" strokeWidth={1} strokeDasharray="4 4" opacity={0.7} />
+                )}
+
+                {baselinePath && <path d={baselinePath} fill="none" stroke="var(--ink-3)" strokeWidth={1.5} opacity={0.9} />}
+                <path d={timelinePath} fill="none" stroke="var(--red)" strokeWidth={2} />
+                <path d={`${timelinePath} L990 100 L30 100 Z`} fill="var(--red)" opacity={0.12} />
+                {!timeline.length && (
+                  <text x={510} y={55} textAnchor="middle" fill="var(--ink-3)" style={{ fontSize: '12px' }}>Run a scenario to plot the real error-rate curve</text>
+                )}
+
+                <line x1={xFor(simTime)} x2={xFor(simTime)} y1={6} y2={104} stroke="var(--ink)" strokeWidth={1.5} />
+                <circle cx={xFor(simTime)} cy={yFor(scrubErr)} r={4} fill="var(--ink)" />
+              </svg>
             </div>
-
-            {/* Timeline SVG Scrubber (with drag and pointer capture) */}
-            <svg
-              id="timeline"
-              viewBox="0 0 1000 120"
-              preserveAspectRatio="none"
-              onPointerDown={(e) => {
-                setIsDragging(true);
-                e.currentTarget.setPointerCapture(e.pointerId);
-                setIsPlaying(false);
-                updateTimelineScrub(e.clientX, e.currentTarget);
-              }}
-              onPointerMove={(e) => {
-                if (isDragging) updateTimelineScrub(e.clientX, e.currentTarget);
-              }}
-              onPointerUp={() => setIsDragging(false)}
-              onPointerCancel={() => setIsDragging(false)}
-            >
-              {/* Grid Lines (scaled to the observed error rate) */}
-              {[0, 0.25, 0.5, 0.75, 1].map((v) => {
-                const y = 100 - v * 80;
-                return (
-                  <g key={v}>
-                    <line x1={30} x2={990} y1={y} y2={y} stroke="var(--line)" strokeWidth={0.6} />
-                    <text x={2} y={y + 3}>{(errScale * v * 100).toFixed(0)}%</text>
-                  </g>
-                );
-              })}
-
-              {/* Time axis labels */}
-              {[0, 1, 2, 3, 4, 5, 6].map((i) => (
-                <text key={i} x={xFor((i / 6) * duration) - 8} y={114}>{fmtTime((i / 6) * duration)}</text>
-              ))}
-
-              {/* Scenario Event Markers */}
-              {eventMarkers.map((m, i) => {
-                const color = m.kind === 'load'
-                  ? 'var(--accent)'
-                  : ['kill', 'restart'].includes(m.kind)
-                  ? 'var(--bad)'
-                  : m.kind === 'restore'
-                  ? 'var(--ok)'
-                  : 'var(--warn)';
-                return (
-                  <line
-                    key={i}
-                    x1={xFor(m.t)}
-                    x2={xFor(m.t)}
-                    y1={10}
-                    y2={100}
-                    stroke={color}
-                    strokeWidth={1.1}
-                    opacity={0.65}
-                  />
-                );
-              })}
-
-              {/* SLO Threshold */}
-              {viewResult?.slo_error_rate !== undefined && (
-                <line
-                  x1={30}
-                  x2={990}
-                  y1={yFor(viewResult.slo_error_rate)}
-                  y2={yFor(viewResult.slo_error_rate)}
-                  stroke="var(--muted)"
-                  strokeWidth={1}
-                  strokeDasharray="4 4"
-                  opacity={0.7}
-                />
-              )}
-
-              {/* Baseline curve, overlaid when comparing */}
-              {baselinePath && (
-                <path d={baselinePath} fill="none" stroke="var(--muted)" strokeWidth={1.5} opacity={0.9} />
-              )}
-
-              {/* Real error-rate curve sampled from the simulation */}
-              <path d={timelinePath} fill="none" stroke="var(--bad)" strokeWidth={2} />
-              <path d={`${timelinePath} L990 100 L30 100 Z`} fill="var(--bad)" opacity={0.12} />
-              {!timeline.length && (
-                <text x={510} y={55} textAnchor="middle" fill="var(--muted)" style={{ fontSize: '12px' }}>
-                  Run a scenario to plot the real error-rate curve
-                </text>
-              )}
-
-              {/* Active Scrub Marker Head */}
-              <line
-                x1={xFor(simTime)}
-                x2={xFor(simTime)}
-                y1={6}
-                y2={104}
-                stroke="var(--text)"
-                strokeWidth={1.5}
-              />
-              <circle
-                cx={xFor(simTime)}
-                cy={yFor(scrubErr)}
-                r={4}
-                fill="var(--text)"
-              />
-            </svg>
-          </div>
           ) : (
-            <div className="tl tl-empty">
-              <span>Run a scenario to generate the replay timeline.</span>
-            </div>
+            <div className="tl tl-empty"><span>Run a scenario to generate the replay timeline.</span></div>
           )}
         </section>
 
-        {/* ===== RIGHT COLUMN: Inspector + Real Cascade Failure Story + Findings ===== */}
+        {/* RIGHT RAIL */}
         <aside className="stack right">
-          {/* Node Inspector */}
           <section className="card" aria-labelledby="ih">
-            <h2 id="ih">
-              <span>Node Inspector</span>
-              {selectedNode && <span className="chip">{selectedNode.type}</span>}
-            </h2>
-
+            <h2 id="ih"><span>Node inspector</span>{selectedNode && <span className="chip">{selectedNode.type}</span>}</h2>
             {selectedNode ? (
               <div>
                 <div className="insp-title">
                   <b>{selectedNode.label}</b>
                   {selectedNodeState && (
-                    <span
-                      className="state"
-                      style={{
-                        background:
-                          selectedNodeState.state === 'ok'
-                            ? 'rgba(34, 197, 94, 0.15)'
-                            : selectedNodeState.state === 'warn'
-                            ? 'rgba(245, 165, 36, 0.15)'
-                            : 'rgba(240, 68, 97, 0.15)',
-                        color:
-                          selectedNodeState.state === 'ok'
-                            ? 'var(--ok)'
-                            : selectedNodeState.state === 'warn'
-                            ? 'var(--warn)'
-                            : 'var(--bad)',
-                      }}
-                    >
-                      {selectedNodeState.state}
-                    </span>
+                    <span className="state" style={{
+                      background: selectedNodeState.state === 'ok' ? 'rgba(109,219,160,.15)' : selectedNodeState.state === 'warn' ? 'rgba(242,166,90,.15)' : 'rgba(255,107,125,.15)',
+                      color: selectedNodeState.state === 'ok' ? 'var(--green)' : selectedNodeState.state === 'warn' ? 'var(--orange)' : 'var(--red)',
+                    }}>{selectedNodeState.state}</span>
                   )}
                 </div>
-
                 <div className="rows">
-                  <dt>Replicas</dt>
-                  <dd>{selectedNode.replicas} active</dd>
-                  <dt>Capacity</dt>
-                  <dd>{selectedNode.replicas * selectedNode.concurrency} concurrent slots</dd>
-                  <dt>Latency (p50 / p99)</dt>
-                  <dd>{selectedNode.p50 || 15}ms / {selectedNode.p99 || 45}ms</dd>
-                  {selectedNode.requires && (
-                    <>
-                      <dt>Startup Dependencies</dt>
-                      <dd>{selectedNode.requires.join(', ')}</dd>
-                    </>
-                  )}
-                  {selectedNode.rate_limit && (
-                    <>
-                      <dt>Rate Limit</dt>
-                      <dd>{selectedNode.rate_limit} rps</dd>
-                    </>
-                  )}
+                  <dt>Replicas</dt><dd>{selectedNode.replicas} active</dd>
+                  <dt>Capacity</dt><dd>{selectedNode.replicas * selectedNode.concurrency} concurrent slots</dd>
+                  <dt>Latency (p50 / p99)</dt><dd>{selectedNode.p50 || 15}ms / {selectedNode.p99 || 45}ms</dd>
+                  {selectedNode.requires && <><dt>Startup dependencies</dt><dd>{selectedNode.requires.join(', ')}</dd></>}
+                  {selectedNode.rate_limit && <><dt>Rate limit</dt><dd>{selectedNode.rate_limit} rps</dd></>}
                 </div>
-
                 <div className="bar">
-                  <i
-                    style={{
-                      width: `${Math.min(100, (selectedNodeState?.util || 0.2) * 100)}%`,
-                      background:
-                        selectedNodeState?.state === 'ok'
-                          ? 'var(--ok)'
-                          : selectedNodeState?.state === 'warn'
-                          ? 'var(--warn)'
-                          : 'var(--bad)',
-                    }}
-                  />
+                  <i style={{
+                    width: `${Math.min(100, (selectedNodeState?.util || 0.2) * 100)}%`,
+                    background: selectedNodeState?.state === 'ok' ? 'var(--green)' : selectedNodeState?.state === 'warn' ? 'var(--orange)' : 'var(--red)',
+                  }} />
                 </div>
-                <div style={{ fontSize: '11px', color: 'var(--muted)', marginTop: '4px' }}>
-                  {selectedNodeState?.note}
-                </div>
+                <div className="micro" style={{ marginTop: '4px' }}>{selectedNodeState?.note}</div>
               </div>
             ) : (
-              <p className="insp-empty">Click any node on the graph to inspect internal queuing and latency.</p>
+              <p className="insp-empty">Click any node on the graph to inspect queuing and latency.</p>
             )}
           </section>
 
-          {/* Failure Story (Driven by Real Simulation Cascade Events) */}
           <section className="card" id="story-sec" aria-labelledby="sth">
-            <h2 id="sth">
-              <span>Failure Story</span>
-              <span className="chip">{viewResult?.cascade?.length || 0} steps</span>
-            </h2>
+            <h2 id="sth"><span>Failure story</span><span className="chip">{viewResult?.cascade?.length || 0} steps</span></h2>
             <ol className="story">
               {viewResult && viewResult.cascade && viewResult.cascade.length > 0 ? (
                 viewResult.cascade.map((c: any, i: number) => {
                   const isPast = simTime >= c.t;
-                  const dotColor =
-                    c.what.includes('kill') || c.what.includes('down')
-                      ? 'var(--bad)'
-                      : c.what.includes('saturated') || c.what.includes('unhealthy')
-                      ? 'var(--warn)'
-                      : c.what.includes('boot')
-                      ? 'var(--boot)'
-                      : 'var(--ok)';
-
+                  const dotColor = c.what.includes('kill') || c.what.includes('down') ? 'var(--red)' : c.what.includes('saturated') || c.what.includes('unhealthy') ? 'var(--orange)' : c.what.includes('boot') ? 'var(--boot)' : 'var(--green)';
                   return (
-                    <li
-                      key={i}
-                      className={isPast ? 'past' : ''}
-                      onClick={() => setSimTime(Math.round(c.t))}
-                    >
+                    <li key={i} className={isPast ? 'past' : ''} onClick={() => setSimTime(Math.round(c.t))}>
                       <div className="b" style={{ borderColor: dotColor }} />
                       <time>{fmtTime(c.t)}</time>
-                      <div className="txt">
-                        <strong>{c.node || c.edge}:</strong> {c.detail || c.what}
-                      </div>
+                      <div className="txt"><strong>{c.node || c.edge}:</strong> {c.detail || c.what}</div>
                     </li>
                   );
                 })
@@ -1267,7 +1381,7 @@ export default function App() {
                   ))}
                   {(rawScenario?.events ?? []).map((e: any, i: number) => (
                     <li key={`story-event-${i}`} className={simTime >= e.at_s ? 'past' : ''} onClick={() => setSimTime(e.at_s)}>
-                      <div className="b" style={{ borderColor: ['kill', 'restart'].includes(e.action) ? 'var(--bad)' : e.action === 'restore' ? 'var(--ok)' : 'var(--warn)' }} />
+                      <div className="b" style={{ borderColor: ['kill', 'restart'].includes(e.action) ? 'var(--red)' : e.action === 'restore' ? 'var(--green)' : 'var(--orange)' }} />
                       <time>{fmtTime(e.at_s)}</time>
                       <div className="txt">{describeEvent(e)}</div>
                     </li>
@@ -1281,38 +1395,102 @@ export default function App() {
             </ol>
           </section>
 
-          {/* Post-simulation, evidence-driven remediation */}
-          <section className="card" id="findings" aria-labelledby="fh">
-            <h2 id="fh">
-              <span>Targeted Fixes</span>
-              <span className="chip">{result ? `${recommendations.length} for this run` : 'not run yet'}</span>
-            </h2>
-            <p className="fix-context">{findings.length} static weak spots analyzed for this architecture.</p>
+          <section className="card" id="fixes-sec" aria-labelledby="fh">
+            <h2 id="fh"><span>AI remediation</span><span className="chip">{aiFixes.length} proposals</span></h2>
+            <p className="fix-context">{findings.length} static weak spots analyzed · Discrete, atomic patches proposed from the failed run. Select any and re-simulate together.</p>
+
+            {promptError && (
+              <div className="insight-card error" role="alert">
+                <span className="micro">Prompt error</span>
+                <span>{promptError}</span>
+              </div>
+            )}
+
+            {currentPassed === true && (
+              <div className="insight-card success">
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span><b>Survived</b> — nothing to fix for this scenario.</span>
+              </div>
+            )}
+
+            {remediating && (
+              <div className="thinking">
+                <div className="thinking-step">Correlating cascade events with static findings…</div>
+                <div className="thinking-step">Drafting discrete patch operations…</div>
+                <div className="thinking-step">Validating candidate patches…</div>
+              </div>
+            )}
+
+            {!result && <p className="insp-empty">Run an adversarial scenario to surface fix recommendations.</p>}
+
+            {aiFixes.map((fix, idx) => {
+              const id = fixIdOf(fix);
+              const valid = fix.valid !== false;
+              const severity = String(fix.severity || 'medium').toLowerCase();
+              const opCount = Array.isArray(fix.patch?.ops) ? fix.patch.ops.length : 0;
+              return (
+                <div key={id || idx} className={`fix-card ${selectedFixIds.has(id) ? 'sel' : ''} ${valid ? '' : 'invalid'}`}>
+                  <div className="fix-head">
+                    <label className="fix-label">
+                      <input
+                        type="checkbox"
+                        className="fix-check"
+                        checked={selectedFixIds.has(id)}
+                        disabled={!valid || applyingFixes}
+                        onChange={() => toggleFix(id)}
+                      />
+                      <span className={`status-pill ${severity}`}>{severity}</span>
+                      <b>{fix.recommended_pattern || fix.diagnosis || `Fix ${idx + 1}`}</b>
+                    </label>
+                  </div>
+                  <p className="fix-why">{fix.rationale || fix.diagnosis || 'Gemini recommendation'}</p>
+                  <div className="fix-meta">
+                    <span>root · <b>{fix.root_cause_node || '—'}</b></span>
+                    <span>impact · {cellText(fix.predicted_impact)}</span>
+                    <span>{opCount} patch op{opCount === 1 ? '' : 's'}</span>
+                  </div>
+                  {!valid && (
+                    <div className="micro error-text">
+                      invalid: {(fix.validation_errors || []).map((v: any) => cellText(v)).join(' · ') || 'patch validation failed'}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            <div className="approval-bar">
+              <span className="micro">{selectedFixIds.size} selected</span>
+              <div className="approval-actions">
+                <button type="button" className="ghost" onClick={() => setSelectedFixIds(new Set(aiFixes.filter((f) => f.valid !== false).map(fixIdOf)))} disabled={!aiFixes.length}>Select all</button>
+                <button type="button" className="ghost" onClick={() => setSelectedFixIds(new Set())} disabled={!selectedFixIds.size}>Clear</button>
+                <button type="button" className="run small" onClick={handleSimulateSelectedFixes} disabled={!selectedFixes.length || applyingFixes}>
+                  {applyingFixes ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+                  {applyingFixes ? 'Applying…' : 'Simulate selected fixes'}
+                </button>
+              </div>
+            </div>
+
+            {lastDiff && lastDiff.changes?.length > 0 && (
+              <div className="context-card">
+                <div className="micro">Last patch · {lastDiff.changes.length} change(s)</div>
+                <div className="micro">{lastDiff.fingerprint_before?.slice?.(0, 8) || '—'} → {lastDiff.fingerprint_after?.slice?.(0, 8) || fpShort}</div>
+              </div>
+            )}
+
+            <div className="dashed" />
+            <div className="micro section-label">Static hints (manual)</div>
             <div id="finds">
-              {!result && (
-                <p className="insp-empty">Run a scenario to see fixes tied to the failure it actually exposes.</p>
-              )}
-              {result && recommendations.length === 0 && (
-                <p className="insp-empty">No targeted fixes — this run stayed within its SLO envelope.</p>
-              )}
+              {recommendations.length === 0 && <p className="insp-empty">No static hints for this architecture.</p>}
               {recommendations.map((fix) => {
                 const isApplied = appliedFixes.has(fix.id);
                 return (
                   <div key={fix.id} className="find">
-                    <div className="find-h">
-                      <span className={`sev ${fix.severity}`}>{fix.severity}</span>
-                      <b>{fix.target}</b>
-                    </div>
+                    <div className="find-h"><span className={`sev ${fix.severity}`}>{fix.severity}</span><b>{fix.target}</b></div>
                     <p className="fix-title">{fix.title}</p>
                     <p className="fix-why">{fix.why}</p>
                     <div className="fix">
-                      <button
-                        type="button"
-                        className={`apply ${isApplied ? 'applied' : ''}`}
-                        disabled={isApplied || simulating}
-                        onClick={() => handleApplyRecommendedFix(fix)}
-                      >
-                        {isApplied ? '✓ Applied' : 'Apply fix & re-simulate'}
+                      <button type="button" className={`apply ${isApplied ? 'applied' : ''}`} disabled={isApplied || simulating} onClick={() => handleApplyRecommendedFix(fix)}>
+                        {isApplied ? '✓ Applied' : 'Apply & re-simulate'}
                       </button>
                     </div>
                   </div>
@@ -1321,7 +1499,79 @@ export default function App() {
             </div>
           </section>
         </aside>
+
+        {/* COMPARE PANEL */}
+        {designMode === 'compare' && (
+          <section className="card compare-panel" id="compare-sec" aria-labelledby="ch">
+            <h2 id="ch"><span>Before / after</span><span className="chip">seed 42 · same scenario</span></h2>
+            <p className="fix-context">
+              {cellText(scenarioLabel(currentScenarioObject) || selectedScenarioId)}
+              {' · '}
+              {baselineModel?.nodes?.length ?? '—'} → {rawModel?.nodes?.length ?? '—'} nodes · {baselineModel?.edges?.length ?? '—'} → {rawModel?.edges?.length ?? '—'} edges
+            </p>
+            <div className="compare-grid">
+              {compareMetrics.map((m) => (
+                <div className="insight-card" key={m.label}>
+                  <span className="micro">{m.label}</span>
+                  <div className="compare-values"><span>{m.before}</span><b>→</b><strong>{m.after}</strong></div>
+                  <span className="delta">{m.delta}</span>
+                </div>
+              ))}
+            </div>
+
+            <div className="micro section-label">Difference report</div>
+            {diffRows.length ? (
+              <table className="diff-table">
+                <thead><tr><th>Change</th><th>Path</th><th>Before</th><th>After</th></tr></thead>
+                <tbody>
+                  {diffRows.map((row, i) => (
+                    <tr key={i}>
+                      <td><span className={`status-pill ${row.kind === 'resolved' ? 'low' : row.kind === 'new' ? 'high' : ''}`}>{row.kind}</span></td>
+                      <td className="mono-cell">{cellText(row.path)}</td>
+                      <td className="mono-cell">{cellText(row.before)}</td>
+                      <td className="mono-cell">{cellText(row.after)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <p className="insp-empty">No structural differences reported — behaviour changed through the same topology.</p>
+            )}
+          </section>
+        )}
       </main>
+
+      {/* ===== BOTTOM PROMPT DOCK ===== */}
+      <div className="prompt-dock">
+        <div className="dock-side">
+          <span className="context-chip">@architecture</span>
+          <span className="status-pill">{isCreatingNew ? 'draft: new' : (rawModel?.name || 'no model')}</span>
+        </div>
+        <div className="dock-core">
+          {thinkingSteps.length > 0 && (
+            <div className="thinking inline">
+              {thinkingSteps.map((s, i) => <span className="thinking-step" key={i}>{s}</span>)}
+            </div>
+          )}
+          <textarea
+            className="dock-input"
+            value={promptText}
+            onChange={(e) => setPromptText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleApplyPrompt();
+              }
+            }}
+            placeholder={isCreatingNew ? 'Describe a new architecture…' : 'Ask Gemini to change only what you describe…'}
+            rows={1}
+          />
+        </div>
+        <button type="button" className="dock-send" onClick={handleApplyPrompt} disabled={isApplyingPrompt || !promptText.trim()}>
+          {isApplyingPrompt ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Wand2 className="w-3.5 h-3.5" />}
+          <span>{isApplyingPrompt ? 'Working…' : (isCreatingNew ? 'Generate' : 'Apply')}</span>
+        </button>
+      </div>
 
       {/* ===== SLIDE-OVER DRAWER (Prompt, Spec Editor, Import/Export) ===== */}
       {isDrawerOpen && (
@@ -1330,169 +1580,84 @@ export default function App() {
             <div className="drawer-head">
               <h3>
                 <Sparkles className="w-4 h-4 text-accent" />
-                <span>Architecture Modeler</span>
+                {isCreatingNew ? 'Describe a new architecture' : 'Architecture modeler'}
               </h3>
-              <button type="button" className="drawer-close" onClick={() => setIsDrawerOpen(false)}>
-                <X className="w-4 h-4" />
-              </button>
+              <button type="button" className="drawer-close" onClick={() => setIsDrawerOpen(false)}><X className="w-4 h-4" /></button>
             </div>
 
             <div className="drawer-tabs">
-              <button
-                type="button"
-                className={`drawer-tab ${drawerTab === 'prompt' ? 'active' : ''}`}
-                onClick={() => setDrawerTab('prompt')}
-              >
-                AI Prompting
-              </button>
-              <button
-                type="button"
-                className={`drawer-tab ${drawerTab === 'editor' ? 'active' : ''}`}
-                onClick={() => setDrawerTab('editor')}
-              >
-                YAML Editor
-              </button>
-              <button
-                type="button"
-                className={`drawer-tab ${drawerTab === 'import_export' ? 'active' : ''}`}
-                onClick={() => setDrawerTab('import_export')}
-              >
-                Import / Export
-              </button>
+              <button type="button" className={`drawer-tab ${drawerTab === 'prompt' ? 'active' : ''}`} onClick={() => setDrawerTab('prompt')}>AI prompting</button>
+              <button type="button" className={`drawer-tab ${drawerTab === 'editor' ? 'active' : ''}`} onClick={() => setDrawerTab('editor')}>YAML editor</button>
+              <button type="button" className={`drawer-tab ${drawerTab === 'import_export' ? 'active' : ''}`} onClick={() => setDrawerTab('import_export')}>Import / export</button>
             </div>
 
             <div className="drawer-body">
               {drawerTab === 'prompt' && (
                 <div>
-                  <label style={{ fontSize: '12px', fontWeight: 600, color: 'var(--muted)', display: 'block', marginBottom: '8px' }}>
-                    Describe architectural modifications or resilience requirements:
+                  <label className="field-label">
+                    {isCreatingNew
+                      ? 'Describe a new architecture'
+                      : 'Describe architectural modifications or resilience requirements'}
                   </label>
                   <textarea
                     className="editor-textarea"
-                    style={{ height: '140px' }}
-                    placeholder="e.g. Add 2 read replicas to database with write_ratio 0.2 and enable exponential backoff on payment gateway..."
+                    style={{ height: '150px' }}
+                    placeholder={isCreatingNew
+                      ? 'Describe a new architecture…'
+                      : 'e.g. Add 2 read replicas to the database with write_ratio 0.2 and enable exponential backoff on payment gateway…'}
                     value={promptText}
                     onChange={(e) => setPromptText(e.target.value)}
                   />
-
-                  <div style={{ marginTop: '16px' }}>
-                    <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--muted)', textTransform: 'uppercase', marginBottom: '8px' }}>
-                      Quick Preset Enhancements
-                    </div>
-                    <div className="chip-group">
-                      <button
-                        type="button"
-                        className="chip-btn"
-                        onClick={() => setPromptText('Add Redis cache with 90% warm hit rate to relieve database')}
-                      >
-                        + Add Redis Cache
-                      </button>
-                      <button
-                        type="button"
-                        className="chip-btn"
-                        onClick={() => setPromptText('Scale database with 2 read replicas and read fallback')}
-                      >
-                        + Add Read Replicas
-                      </button>
-                      <button
-                        type="button"
-                        className="chip-btn"
-                        onClick={() => setPromptText('Enable exponential backoff with jitter on all downstream retries')}
-                      >
-                        + Exponential Backoff &amp; Jitter
-                      </button>
-                      <button
-                        type="button"
-                        className="chip-btn"
-                        onClick={() => setPromptText('Break circular startup boot dependencies')}
-                      >
-                        + Break Boot Deadlock
-                      </button>
-                    </div>
-                  </div>
-
-                  {promptError && (
-                    <div style={{ color: '#ef4444', background: 'rgba(239,68,68,0.1)', padding: '10px', borderRadius: '6px', fontSize: '12px', marginTop: '12px' }}>
-                      ⚠️ {promptError}
+                  {thinkingSteps.length > 0 && (
+                    <div className="thinking">
+                      {thinkingSteps.map((s, i) => <div className="thinking-step" key={i}>{s}</div>)}
                     </div>
                   )}
+                  <div className="dashed" />
+                  <div className="micro section-label">Quick presets</div>
+                  <div className="chip-group">
+                    <button type="button" className="chip-btn" onClick={() => { setIsCreatingNew(false); setPromptText('Add Redis cache with 90% warm hit rate to relieve database'); }}>+ Redis cache</button>
+                    <button type="button" className="chip-btn" onClick={() => { setIsCreatingNew(false); setPromptText('Scale database with 2 read replicas and read fallback'); }}>+ Read replicas</button>
+                    <button type="button" className="chip-btn" onClick={() => { setIsCreatingNew(false); setPromptText('Enable exponential backoff with jitter on all downstream retries'); }}>+ Backoff &amp; jitter</button>
+                    <button type="button" className="chip-btn" onClick={() => { setIsCreatingNew(false); setPromptText('Break circular startup boot dependencies'); }}>+ Break boot deadlock</button>
+                  </div>
+                  {promptError && <div className="insight-card error" role="alert"><span className="micro">Error</span><span>{promptError}</span></div>}
                 </div>
               )}
 
               {drawerTab === 'editor' && (
                 <div>
-                  <label style={{ fontSize: '12px', fontWeight: 600, color: 'var(--muted)', display: 'block', marginBottom: '8px' }}>
-                    Live Architecture YAML Specification:
-                  </label>
-                  <textarea
-                    className="editor-textarea"
-                    value={rawYaml}
-                    onChange={(e) => setRawYaml(e.target.value)}
-                  />
+                  <label className="field-label">Live architecture YAML specification</label>
+                  <textarea className="editor-textarea" value={rawYaml} onChange={(e) => setRawYaml(e.target.value)} />
                 </div>
               )}
 
               {drawerTab === 'import_export' && (
                 <div>
-                  <h4 style={{ fontSize: '13px', marginBottom: '8px' }}>Import Architecture Spec</h4>
-                  <p style={{ fontSize: '12px', color: 'var(--muted)', marginBottom: '12px' }}>
-                    Upload any custom YAML or JSON architecture file to simulate and stress-test:
-                  </p>
-                  <button
-                    type="button"
-                    className="action-btn"
-                    onClick={() => fileInputRef.current?.click()}
-                    style={{ marginBottom: '16px' }}
-                  >
-                    <Upload className="w-4 h-4" />
-                    <span>Choose File (.yaml / .json)</span>
+                  <h4 className="drawer-subtitle">Import architecture spec</h4>
+                  <p className="fix-context">Upload any custom YAML or JSON architecture file to simulate and stress-test.</p>
+                  <button type="button" className="action-btn" onClick={() => fileInputRef.current?.click()} style={{ marginBottom: '16px' }}>
+                    <Upload className="w-4 h-4" /><span>Choose file (.yaml / .json)</span>
                   </button>
-                  {importStatus && (
-                    <div style={{ fontSize: '12px', color: 'var(--accent)', marginBottom: '16px' }}>
-                      {importStatus}
-                    </div>
-                  )}
-
-                  <hr style={{ border: 0, borderTop: '1px solid var(--line)', margin: '16px 0' }} />
-
-                  <h4 style={{ fontSize: '13px', marginBottom: '8px' }}>Export Architecture Spec</h4>
-                  <p style={{ fontSize: '12px', color: 'var(--muted)', marginBottom: '12px' }}>
-                    Download the current architecture definition:
-                  </p>
+                  {importStatus && <div className="insight-card"><span>{importStatus}</span></div>}
+                  <div className="dashed" />
+                  <h4 className="drawer-subtitle">Export architecture spec</h4>
+                  <p className="fix-context">Download the current architecture definition.</p>
                   <button type="button" className="action-btn" onClick={handleExportYaml}>
-                    <Download className="w-4 h-4" />
-                    <span>Download {rawModel?.name || selectedModelId}.yaml</span>
+                    <Download className="w-4 h-4" /><span>Download {rawModel?.name || selectedModelId || 'architecture'}.yaml</span>
                   </button>
                 </div>
               )}
             </div>
 
             <div className="drawer-footer">
-              <button type="button" className="action-btn" onClick={() => setIsDrawerOpen(false)}>
-                Cancel
-              </button>
+              <button type="button" className="action-btn" onClick={() => setIsDrawerOpen(false)}>Cancel</button>
               {drawerTab === 'prompt' && (
-                <button
-                  type="button"
-                  className="run"
-                  onClick={handleApplyPrompt}
-                  disabled={isApplyingPrompt}
-                >
-                  {isApplyingPrompt ? (
-                    <>
-                      <RefreshCw className="w-4 h-4 animate-spin" />
-                      <span>Generating with Vertex AI…</span>
-                    </>
-                  ) : (
-                    <span>Apply with Vertex AI</span>
-                  )}
+                <button type="button" className="run" onClick={handleApplyPrompt} disabled={isApplyingPrompt || !promptText.trim()}>
+                  {isApplyingPrompt ? <><RefreshCw className="w-4 h-4 animate-spin" /><span>Working…</span></> : <span>{isCreatingNew ? 'Generate with Gemini' : 'Apply with Gemini'}</span>}
                 </button>
               )}
-              {drawerTab === 'editor' && (
-                <button type="button" className="run" onClick={handleApplySpec}>
-                  Validate &amp; Apply Spec
-                </button>
-              )}
+              {drawerTab === 'editor' && <button type="button" className="run" onClick={handleApplySpec}>Validate &amp; apply spec</button>}
             </div>
           </div>
         </div>
@@ -1502,8 +1667,8 @@ export default function App() {
         <div className="sim-overlay" role="status" aria-live="polite">
           <div className="sim-card">
             <div className="sim-spinner" />
-            <strong>Simulating failure scenario…</strong>
-            <span>{selectedScenarioId} · {selectedModelId}</span>
+            <strong>{remediating ? 'Gemini is proposing fixes…' : 'Simulating failure scenario…'}</strong>
+            <span>{scenarioLabel(currentScenarioObject) || selectedScenarioId} · {rawModel?.name || selectedModelId}</span>
           </div>
         </div>
       )}
