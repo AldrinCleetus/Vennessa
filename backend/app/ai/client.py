@@ -21,15 +21,14 @@ from google import genai
 
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env if present
-env_path = Path(__file__).resolve().parents[2] / ".env"
-if env_path.exists():
-    load_dotenv(env_path)
-else:
-    # Also check root of repository
-    root_env = Path(__file__).resolve().parents[4] / ".env"
-    if root_env.exists():
-        load_dotenv(root_env)
+# Load environment variables from .env if present. Walk up a bounded number
+# of ancestors so this works both from a source checkout and inside the
+# Docker image, where the path is much shallower (``/app/app/ai/client.py``).
+for _parent in list(Path(__file__).resolve().parents)[:4]:
+    _env_candidate = _parent / ".env"
+    if _env_candidate.exists():
+        load_dotenv(_env_candidate)
+        break
 
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "boreal-union-515307-d9")
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "asia-south1")
