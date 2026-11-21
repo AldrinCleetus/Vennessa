@@ -1,0 +1,62 @@
+[
+  {
+    "id": "01_problem_intro",
+    "narration": "Startups often discover critical bottlenecks and retry storms only after deploying, causing catastrophic downtime. Project Venessa lets teams stress-test and harden distributed architectures before writing deployment code.",
+    "action_description": "Initial view of the Project Venessa dashboard showcasing the complete architecture canvas and pre-mortem simulation controls."
+  },
+  {
+    "id": "02_architecture_topology",
+    "narration": "The canvas models your full topology, from load balancers down to caches and databases. Selecting any node opens the Inspector to reveal replica counts, concurrency limits, and latency profiles.",
+    "action_description": "Hover over the service graph and click on a service node to display its replica count, concurrency limits, and latency percentiles in the Node Inspector."
+  },
+  {
+    "id": "03_select_scenario",
+    "narration": "We pick an explicit failure scenario: Cache Kill at Peak Surge. This injects a three-times traffic surge followed by an abrupt cache termination at seven hundred seconds.",
+    "action_description": "Select 03_cache_kill_at_peak from the Scenario dropdown and highlight the injected failure events in the Scenario Events panel."
+  },
+  {
+    "id": "04_run_simulation",
+    "narration": "Hitting Run Scenario triggers the SimPy discrete-event engine. Hundreds of thousands of synthetic requests stream through system queues, evaluating queue limits and timeout cascades in milliseconds.",
+    "action_description": "Click the Run Scenario button in the top navigation bar and observe the simulation execution overlay."
+  },
+  {
+    "id": "05_incident_verdict",
+    "narration": "The Verdict flags a catastrophic outage, breaching our service level objective for over one hundred seconds with a forty-four percent peak error rate and thousands of dropped transactions.",
+    "action_description": "Inspect the red Verdict card and hover across the key performance indicators showing peak error rate and recovery status."
+  },
+  {
+    "id": "06_failure_story",
+    "narration": "The Failure Story reveals the chain reaction: cache termination backed up the database, saturated connection pools, and triggered an amplified retry storm. Clicking any step jumps directly to that moment.",
+    "action_description": "Scroll down the Failure Story timeline in the right sidebar and click the cascade event where database connection pools saturated."
+  },
+  {
+    "id": "07_timeline_scrubber",
+    "narration": "The interactive timeline replays the incident second by second. Dragging across the error curve visualizes real-time queue saturation as services turn from healthy green to failing red.",
+    "action_description": "Click the Play button on the timeline scrubber, then drag the scrub head through the incident peak to watch node statuses dynamically shift color."
+  },
+  {
+    "id": "08_ai_adversary",
+    "narration": "Venessa's AI Adversary synthesizes targeted failure vectors against single points of failure. Engineers can test database slowdowns, network partitions, or gateway timeouts with one click.",
+    "action_description": "Hover through the AI Adversary vectors in the left sidebar, pointing out which scenarios break the SLO envelope versus those that survive."
+  },
+  {
+    "id": "09_targeted_remediation",
+    "narration": "Under Targeted Fixes, Gemini synthesizes evidence-based remediations for the exposed failure points, recommending database read replicas and exponential backoff with jitter.",
+    "action_description": "Review the Targeted Fixes card highlighting recommendations to add read replicas and configure exponential backoff on retry edges."
+  },
+  {
+    "id": "10_apply_and_compare",
+    "narration": "Applying the fix patches the architecture and instantly re-simulates. Switching to Compare mode reveals the before-and-after contrast: the error curve flattens completely and the system survives.",
+    "action_description": "Click Apply fix & re-simulate, then click the Compare button in the top navigation to view side-by-side error curves demonstrating complete recovery."
+  },
+  {
+    "id": "11_ai_prompt_drawer",
+    "narration": "Teams can also evolve designs using the prompt bar. Prompt in plain English or edit the YAML spec, and Gemini recompiles the topology and runs validation checks instantly.",
+    "action_description": "Demonstrate the bottom prompt dock by typing an architectural enhancement instruction and previewing the action."
+  },
+  {
+    "id": "12_tech_stack_summary",
+    "narration": "Built with FastAPI, SimPy, Google Gemini, and React, Project Venessa transforms architectural blindspots into verified resilience, safeguarding Day-One deployments.",
+    "action_description": "Return to the main Architecture view and showcase the final hardened architecture running cleanly with zero dropped requests."
+  }
+]

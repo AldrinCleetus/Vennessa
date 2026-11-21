@@ -1,0 +1,13 @@
+{
+  "name": "venessa-demo-recorder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright screen recording pipeline for Project Venessa",
+  "main": "record.js",
+  "scripts": {
+    "record": "node record.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}

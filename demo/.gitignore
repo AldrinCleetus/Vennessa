@@ -1,0 +1,11 @@
+# Ignored local files
+recordings/
+audio/
+temp_audio/
+*.mp4
+*.wav
+auth.json
+timings.json
+durations.json
+captions.srt
+node_modules/
