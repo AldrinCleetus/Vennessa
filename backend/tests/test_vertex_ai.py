@@ -66,14 +66,7 @@ edges:
     to: backend
     timeout_ms: 2000
 """
-    mock_resp = MagicMock()
-    mock_resp.text = f"```yaml\n{sample_yaml}\n```"
-
-    with patch("app.ai.client.get_vertex_client") as mock_client_factory:
-        mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(return_value=mock_resp)
-        mock_client_factory.return_value = mock_client
-
+    with _mock_gemini(f"```yaml\n{sample_yaml}\n```"):
         arch, yaml_out = asyncio.run(text_to_architecture_yaml("A simple web app"))
         assert arch.name == "generated_app"
         assert len(arch.nodes) == 2
@@ -97,14 +90,7 @@ events:
     factor: 4.0
     duration_s: 30
 """
-    mock_resp = MagicMock()
-    mock_resp.text = f"```yaml\n{sample_scenario_yaml}\n```"
-
-    with patch("app.ai.client.get_vertex_client") as mock_client_factory:
-        mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(return_value=mock_resp)
-        mock_client_factory.return_value = mock_client
-
+    with _mock_gemini(f"```yaml\n{sample_scenario_yaml}\n```"):
         scenario, yaml_out, hypothesis, targets = asyncio.run(generate_adversary_scenario(arch))
         assert scenario.name == "test_attack"
         assert targets == ["db"]

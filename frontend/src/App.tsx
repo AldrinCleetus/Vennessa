@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { Finding, SimulationResult, ModelSummary, ScenarioSummary, TimelinePoint } from './types';
 import { applyFix, recommendFixes, RecommendedFix } from './lib/recommendations';
+import { apiFetch } from './lib/api';
 
 interface LayoutNode {
   id: string;
@@ -185,7 +186,7 @@ export default function App() {
 
   // 1. Initial Load: Fetch models & scenarios
   useEffect(() => {
-    fetch(`/api/models`)
+    apiFetch(`/api/models`)
       .then((r) => r.json())
       .then((d) => {
         if (d.models && d.models.length > 0) {
@@ -194,7 +195,7 @@ export default function App() {
       })
       .catch((e) => console.error('Failed to list models', e));
 
-    fetch(`/api/scenarios`)
+    apiFetch(`/api/scenarios`)
       .then((r) => r.json())
       .then((d) => {
         if (d.scenarios && d.scenarios.length > 0) {
@@ -224,7 +225,7 @@ export default function App() {
     setSimError(null);
     setIsPlaying(false);
     setSimTime(0);
-    fetch(`/api/scenarios/${selectedScenarioId}`)
+    apiFetch(`/api/scenarios/${selectedScenarioId}`)
       .then((r) => r.json())
       .then((d) => setRawScenario(d.data || null))
       .catch((e) => console.error('Failed to load scenario', e));
@@ -233,7 +234,7 @@ export default function App() {
   // 2. Load model data when selectedModelId changes
   useEffect(() => {
     if (!selectedModelId) return;
-    fetch(`/api/models/${selectedModelId}`)
+    apiFetch(`/api/models/${selectedModelId}`)
       .then((r) => r.json())
       .then((d) => {
         setRawModel(d.data);
@@ -262,7 +263,7 @@ export default function App() {
   const runStaticAnalysis = async (modelData?: any) => {
     try {
       const payload = modelData || rawModel || selectedModelId;
-      const res = await fetch(`/api/analyze`, {
+      const res = await apiFetch(`/api/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ architecture: payload }),
@@ -286,7 +287,7 @@ export default function App() {
     setAiFixes([]);
     setSelectedFixIds(new Set());
     try {
-      const res = await fetch('/api/ai/remediate', {
+      const res = await apiFetch('/api/ai/remediate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -331,12 +332,12 @@ export default function App() {
     try {
       const payload = modelToRun ?? rawModel ?? selectedModelId;
       const arch = typeof payload === 'string'
-        ? (await (await fetch(`/api/models/${payload}`)).json()).data
+        ? (await (await apiFetch(`/api/models/${payload}`)).json()).data
         : payload;
       if (!arch) throw new Error('Could not resolve the architecture to simulate.');
 
       // Analyze the exact model being run so fixes match what this run actually hit.
-      const analysisRes = await fetch(`/api/analyze`, {
+      const analysisRes = await apiFetch(`/api/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ architecture: arch }),
@@ -344,7 +345,7 @@ export default function App() {
       const analysis = analysisRes.ok ? await analysisRes.json() : { findings: [] };
       setFindings(analysis.findings || []);
 
-      const res = await fetch(`/api/simulate`, {
+      const res = await apiFetch(`/api/simulate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -402,7 +403,7 @@ export default function App() {
     setAiStatus('Gemini is drafting adversarial scenarios…');
     setAiWarnings([]);
     try {
-      const res = await fetch('/api/ai/adversary', {
+      const res = await apiFetch('/api/ai/adversary', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -472,7 +473,7 @@ export default function App() {
       setThinkingSteps((prev) => [...prev, mode === 'create' ? 'Designing the topology…' : 'Applying the requested change…']);
       await new Promise((resolve) => setTimeout(resolve, 260));
 
-      const res = await fetch('/api/ai/text-to-model', {
+      const res = await apiFetch('/api/ai/text-to-model', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -555,7 +556,7 @@ export default function App() {
         base_fingerprint: beforeFingerprint ?? undefined,
         ops: selectedFixes.flatMap((f) => (Array.isArray(f.patch?.ops) ? f.patch.ops : [])),
       };
-      const res = await fetch('/api/architectures/patch', {
+      const res = await apiFetch('/api/architectures/patch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
